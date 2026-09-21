@@ -1,0 +1,210 @@
+---
+title: 'Doctors API: List Profiles and Manage Availability Slots'
+sidebarTitle: 'Doctors'
+description: "Browse doctor profiles with optional specialization filtering, create availability slots as a doctor or admin, and list a doctor's slots by status."
+---
+
+The Doctors API exposes three endpoints under `/v1/doctors` for discovering practitioners and managing their calendars. Listing doctors and their slots is open to unauthenticated callers, making it suitable for public-facing search UIs. Creating a slot requires a `doctor` or `admin` role — a doctor always creates slots attributed to their own account; an admin creates them on behalf of the doctor identified by their user ID.
+
+<Info>
+  Doctor records are automatically created during registration when `role` is set to `"doctor"`. The `id` field in `DoctorOut` maps to the doctor's `user_id` in the `users` table.
+</Info>
+
+---
+
+#### GET /v1/doctors
+
+Returns a paginated list of doctor profiles. No authentication required. The `specialization` filter performs a **case-insensitive substring match** (`ILIKE`), so `"cardio"` will match `"Cardiology"`.
+
+**Query parameters**
+
+<ParamField query="specialization" type="string">
+  Optional substring filter on the doctor's specialization field, up to 120 characters. Case-insensitive.
+</ParamField>
+
+<ParamField query="limit" type="integer" default="20">
+  Maximum number of results to return. Capped at `100`.
+</ParamField>
+
+**Response — `200 OK`** — array of `DoctorOut`
+
+<ResponseField name="id" type="string">
+  UUID of the doctor (equals their `user_id`).
+</ResponseField>
+
+<ResponseField name="full_name" type="string | null">
+  The doctor's display name from their profile. May be `null` if the profile row is missing.
+</ResponseField>
+
+<ResponseField name="specialization" type="string">
+  The doctor's registered medical specialization.
+</ResponseField>
+
+<CodeGroup>
+```bash List all doctors (default limit)
+curl -s "https://api.amrutam.example/v1/doctors"
+```
+
+```bash Filter by specialization
+curl -s "https://api.amrutam.example/v1/doctors?specialization=cardio&limit=10"
+```
+</CodeGroup>
+
+```json Response
+[
+  {
+    "id": "018f4e2a-7c3d-7000-a1b2-000000000002",
+    "full_name": "Dr. Rohan Mehta",
+    "specialization": "Cardiology"
+  },
+  {
+    "id": "018f4e2a-7c3d-7000-a1b2-000000000003",
+    "full_name": "Dr. Priya Singh",
+    "specialization": "Cardiology"
+  }
+]
+```
+
+---
+
+#### POST /v1/doctors/slots
+
+Creates a new availability slot for the authenticated doctor. Returns `201 Created`. Requires a Bearer token with the `doctor` or `admin` role.
+
+The slot is linked to the `user_id` extracted from the JWT — a doctor can only create slots for themselves. The service validates that `ends_at` is strictly after `starts_at`; equal or reversed timestamps return `400 Bad Request`.
+
+<Note>
+  Newly created slots are assigned `status: "open"` by the database default. Only `open` slots can be reserved by patients via the Bookings API. The `version` field starts at `1` and is incremented on each state transition to support optimistic locking.
+</Note>
+
+**Request body**
+
+<ParamField body="starts_at" type="string" required>
+  ISO 8601 datetime (e.g. `"2025-09-01T09:00:00Z"`) indicating when the slot begins. Must be before `ends_at`.
+</ParamField>
+
+<ParamField body="ends_at" type="string" required>
+  ISO 8601 datetime indicating when the slot ends. Must be strictly after `starts_at`.
+</ParamField>
+
+**Response — `201 Created`** — `SlotOut`
+
+<ResponseField name="id" type="string">
+  UUID of the newly created slot.
+</ResponseField>
+
+<ResponseField name="doctor_id" type="string">
+  UUID of the owning doctor (matches the token's `sub` claim).
+</ResponseField>
+
+<ResponseField name="starts_at" type="string">
+  Slot start time as an ISO 8601 datetime.
+</ResponseField>
+
+<ResponseField name="ends_at" type="string">
+  Slot end time as an ISO 8601 datetime.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Always `"open"` on creation. Transitions to `"held"` when booked and `"cancelled"` if released.
+</ResponseField>
+
+<ResponseField name="version" type="integer">
+  Optimistic-lock version counter. Starts at `1` and increments on every state change.
+</ResponseField>
+
+```bash curl
+curl -s -X POST https://api.amrutam.example/v1/doctors/slots \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." \
+  -H "Content-Type: application/json" \
+  -d '{
+    "starts_at": "2025-09-01T09:00:00Z",
+    "ends_at": "2025-09-01T09:30:00Z"
+  }'
+```
+
+```json Response
+{
+  "id": "018f5a3b-1d2e-7000-b3c4-000000000010",
+  "doctor_id": "018f4e2a-7c3d-7000-a1b2-000000000002",
+  "starts_at": "2025-09-01T09:00:00Z",
+  "ends_at": "2025-09-01T09:30:00Z",
+  "status": "open",
+  "version": 1
+}
+```
+
+---
+
+#### GET /v1/doctors/{doctor_id}/slots
+
+Returns all availability slots belonging to a specific doctor, ordered by `starts_at` ascending. No authentication required. Optionally filter by `status` to narrow results to slots that are still bookable (`open`) or already reserved.
+
+**Path parameters**
+
+<ParamField path="doctor_id" type="string" required>
+  UUID of the doctor whose slots to retrieve. Corresponds to the `id` field returned by `GET /v1/doctors`.
+</ParamField>
+
+**Query parameters**
+
+<ParamField query="status" type="string">
+  Optional filter on slot status, up to 20 characters. Common values: `open`, `held`, `cancelled`. Omit to return slots in all states.
+</ParamField>
+
+**Response — `200 OK`** — array of `SlotOut`
+
+<ResponseField name="id" type="string">
+  UUID of the slot.
+</ResponseField>
+
+<ResponseField name="doctor_id" type="string">
+  UUID of the owning doctor.
+</ResponseField>
+
+<ResponseField name="starts_at" type="string">
+  Slot start time as an ISO 8601 datetime.
+</ResponseField>
+
+<ResponseField name="ends_at" type="string">
+  Slot end time as an ISO 8601 datetime.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Current slot status. One of `open`, `held`, or `cancelled`.
+</ResponseField>
+
+<ResponseField name="version" type="integer">
+  Optimistic-lock version counter.
+</ResponseField>
+
+<CodeGroup>
+```bash All slots for a doctor
+curl -s "https://api.amrutam.example/v1/doctors/018f4e2a-7c3d-7000-a1b2-000000000002/slots"
+```
+
+```bash Only open (bookable) slots
+curl -s "https://api.amrutam.example/v1/doctors/018f4e2a-7c3d-7000-a1b2-000000000002/slots?status=open"
+```
+</CodeGroup>
+
+```json Response
+[
+  {
+    "id": "018f5a3b-1d2e-7000-b3c4-000000000010",
+    "doctor_id": "018f4e2a-7c3d-7000-a1b2-000000000002",
+    "starts_at": "2025-09-01T09:00:00Z",
+    "ends_at": "2025-09-01T09:30:00Z",
+    "status": "open",
+    "version": 1
+  },
+  {
+    "id": "018f5a3b-1d2e-7000-b3c4-000000000011",
+    "doctor_id": "018f4e2a-7c3d-7000-a1b2-000000000002",
+    "starts_at": "2025-09-01T10:00:00Z",
+    "ends_at": "2025-09-01T10:30:00Z",
+    "status": "held",
+    "version": 2
+  }
+]
+```

@@ -1,0 +1,134 @@
+---
+title: 'Search API: Doctor Search with Keyset Pagination'
+sidebarTitle: 'Search'
+description: 'Search doctors by name or specialization on the PostgreSQL read replica, using cursor-based keyset pagination for consistent traversal of large catalogues.'
+---
+
+The search endpoint lets any client — authenticated or not — query the doctor catalogue by free-text or exact specialization. Reads are routed to the PostgreSQL **read replica**, and full-text matching is accelerated by a GIN trigram index on `doctors.specialization` and `profiles.full_name`. For large catalogues, use the `cursor` parameter to page through results without the instability or performance costs of `OFFSET`-based pagination.
+
+## Endpoint
+
+```http
+GET /v1/search/doctors
+```
+
+No authentication is required. The endpoint is intentionally open so patients can browse available doctors before creating an account.
+
+## Query Parameters
+
+<ParamField query="q" type="string">
+  Free-text search term matched against the doctor's full name and specialization. Supports both `ILIKE` prefix matching and trigram similarity (`%` operator) for fuzzy results. Maximum 120 characters.
+</ParamField>
+
+<ParamField query="specialization" type="string">
+  Narrow results to a specific specialization using `ILIKE` substring matching (e.g. `cardio` matches `Cardiology`). Maximum 120 characters.
+</ParamField>
+
+<ParamField query="limit" type="integer" default="20">
+  Number of doctor records to return per page. Must be between 1 and 100 (inclusive).
+</ParamField>
+
+<ParamField query="cursor" type="string">
+  Opaque keyset cursor used to fetch the next page. Pass the `id` value from the **last record** of the previous response. Internally compared as `d.user_id::text > :cursor`, so rows are always ordered consistently by `user_id`.
+</ParamField>
+
+## Response
+
+Returns a JSON array of `DoctorOut` objects ordered by `user_id` ascending. An empty array signals the end of the result set.
+
+<ResponseField name="id" type="string" required>
+  The doctor's UUID, cast to `text`. Use this value as the `cursor` parameter in your next request to paginate forward.
+</ResponseField>
+
+<ResponseField name="full_name" type="string | null">
+  The doctor's display name, sourced from the `profiles` table via a `LEFT JOIN`. May be `null` if the doctor has not completed their profile.
+</ResponseField>
+
+<ResponseField name="specialization" type="string" required>
+  The doctor's specialization string as stored in the `doctors` table (e.g. `"Cardiology"`, `"General Practice"`).
+</ResponseField>
+
+## Keyset Pagination
+
+<Info>
+  Keyset pagination is more efficient than `OFFSET` for deep pages because the database can use an index seek on `user_id` rather than scanning and discarding rows.
+</Info>
+
+The cursor is the `id` of the last record you received. On the first request, omit `cursor` entirely. On each subsequent request, pass the `id` from the final item of the previous page.
+
+```text
+Page 1:  GET /v1/search/doctors?limit=20
+           → returns items 1–20; note last id = "018f4a2b-..."
+
+Page 2:  GET /v1/search/doctors?limit=20&cursor=018f4a2b-...
+           → returns items 21–40
+
+Page N:  continues until fewer than `limit` records are returned
+```
+
+When the response array contains fewer items than your requested `limit`, you have reached the last page.
+
+## Code Examples
+
+<CodeGroup>
+
+```bash Basic search by name
+curl -G https://api.amrutam.example/v1/search/doctors \
+  --data-urlencode "q=Dr. Sharma" \
+  --data-urlencode "limit=5"
+```
+
+```bash Filter by specialization
+curl -G https://api.amrutam.example/v1/search/doctors \
+  --data-urlencode "specialization=Cardiology" \
+  --data-urlencode "limit=10"
+```
+
+```bash Paginate to the next page
+# 1. Fetch first page
+curl -G https://api.amrutam.example/v1/search/doctors \
+  --data-urlencode "limit=20"
+
+# 2. Take the `id` of the last result — e.g. "018f4a2b-93c1-7b3d-8f22-1a2b3c4d5e6f"
+# 3. Pass it as cursor
+curl -G https://api.amrutam.example/v1/search/doctors \
+  --data-urlencode "limit=20" \
+  --data-urlencode "cursor=018f4a2b-93c1-7b3d-8f22-1a2b3c4d5e6f"
+```
+
+</CodeGroup>
+
+### Example Response
+
+```json
+[
+  {
+    "id": "018f4a2b-93c1-7b3d-8f22-1a2b3c4d5e6f",
+    "full_name": "Dr. Priya Sharma",
+    "specialization": "Cardiology"
+  },
+  {
+    "id": "018f4a2c-11d2-7e4e-9033-2b3c4d5e6f7a",
+    "full_name": "Dr. Arjun Mehta",
+    "specialization": "Cardiology"
+  }
+]
+```
+
+## Error Responses
+
+<Accordion title="422 Unprocessable Entity — validation failure">
+  Returned when a query parameter violates a constraint, such as `limit` exceeding `100` or `q` exceeding 120 characters. The response body follows the standard `HTTPValidationError` schema.
+
+  ```json
+  {
+    "detail": [
+      {
+        "loc": ["query", "limit"],
+        "msg": "Input should be less than or equal to 100",
+        "type": "less_than_equal"
+      }
+    ]
+  }
+  ```
+</Accordion>

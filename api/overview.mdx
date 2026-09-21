@@ -1,0 +1,134 @@
+---
+title: "Amrutam REST API: 25 Endpoints for Telemedicine"
+sidebarTitle: "Overview"
+description: "Base URL, Bearer auth, JSON format, keyset pagination, and a grouped summary of all 25 endpoints across the Amrutam Telemedicine API."
+---
+
+The Amrutam Telemedicine API is a production-grade FastAPI service built for scalability, reliability, and security. It exposes 25 routes covering authentication with MFA, doctor availability, idempotent booking, consultation lifecycle management, sealed prescriptions, payment sagas, replica-backed search, and admin analytics. All external traffic is served over TLS through an Nginx edge proxy; internal services communicate over the in-network address. Every protected route uses short-lived RS256 JWTs with rotating refresh tokens and RBAC enforcement.
+
+## Base URL & Versioning
+
+The public API is served over TLS via Nginx. The internal FastAPI process is intentionally not exposed outside the container network.
+
+| Environment | Base URL |
+|---|---|
+| Public (TLS via Nginx) | `https://<host>:8443` |
+| In-network only (internal) | `http://api:8000` |
+
+All resource endpoints are prefixed with `/v1`. Health, readiness, and metrics endpoints are mounted at the root with no version prefix.
+
+```
+https://<host>:8443/v1/auth/login        # versioned resource endpoint
+https://<host>:8443/health               # unversioned health check
+https://<host>:8443/metrics              # unversioned Prometheus metrics
+```
+
+<Note>
+  The API version prefix is controlled by the `api_v1_prefix` setting in `Settings` (default: `/v1`). Do not hardcode version strings in long-lived client code — read the value from your configuration layer.
+</Note>
+
+## Authentication
+
+All protected endpoints require a Bearer token in the `Authorization` header. Tokens are RS256-signed JWTs issued by `POST /v1/auth/login` or `POST /v1/auth/refresh`.
+
+```http
+Authorization: Bearer <access_token>
+```
+
+Access tokens expire after **15 minutes** (`jwt_access_ttl_min`). Use `POST /v1/auth/refresh` with a valid refresh token to obtain a new pair before the access token expires. Refresh tokens are single-use and expire after **7 days** (`jwt_refresh_ttl_days`). Reuse of a consumed refresh token triggers revocation of the entire token family.
+
+<Tip>
+  Enroll TOTP MFA after registration via `POST /v1/auth/mfa/enroll`, then verify the code with `POST /v1/auth/mfa/verify`. Until MFA is verified, the `mfa_verified` claim in the JWT is absent and role-restricted routes will return `403 Forbidden`.
+</Tip>
+
+## Request & Response Format
+
+Every request and response body uses `application/json`. There are no form-encoded or multipart endpoints; prescription PDFs are delivered as presigned S3 URLs, not binary streams.
+
+```http
+Content-Type: application/json
+Accept: application/json
+```
+
+Errors use RFC 7807 Problem+JSON (`Content-Type: application/problem+json`). See the [Errors reference](/api/errors) for the full error schema and status code catalogue.
+
+## Idempotency
+
+Two write endpoints require the `Idempotency-Key` header to enable safe client retries:
+
+| Endpoint | Header | Behaviour |
+|---|---|---|
+| `POST /v1/bookings` | `Idempotency-Key: <uuid>` | Returns `202 + Location` on first call; replays identical response on retry |
+| `POST /v1/payments` | `Idempotency-Key: <uuid>` | Mock charge is not re-executed; webhook replay is also idempotent |
+
+Missing the `Idempotency-Key` on either endpoint returns `400 Bad Request` with `code: bad_request`.
+
+<Warning>
+  Use a fresh UUID v4 per logical operation. Reusing a key with a **different** request body returns `409 Conflict`. Store the key alongside your operation state so you can replay on network failure without generating a new key.
+</Warning>
+
+## Pagination
+
+List endpoints that can return large result sets use **keyset cursor pagination** based on the `(created_at, id)` pair. This avoids the offset drift problem under concurrent inserts.
+
+| Query Parameter | Type | Description |
+|---|---|---|
+| `limit` | integer | Page size. Maximum `100`. Defaults to `20`. |
+| `cursor` | string (opaque) | Cursor returned in the previous page's response. Omit for the first page. |
+
+The `GET /v1/search/doctors` endpoint additionally accepts `q` (full-text query) and `specialization` filter parameters alongside the cursor params.
+
+## Endpoint Reference
+
+All 25 routes are grouped by domain below. The **Auth** column reflects the minimum requirement — open endpoints still return errors if a malformed token is supplied.
+
+| Group | Endpoints | Auth |
+|---|---|---|
+| **Health** | `GET /health`, `GET /ready`, `GET /metrics` | Open |
+| **Auth** | `POST /v1/auth/register`, `POST /v1/auth/login`, `POST /v1/auth/refresh`, `POST /v1/auth/mfa/enroll`, `POST /v1/auth/mfa/verify`, `GET /v1/auth/me`, `GET /v1/auth/admin/ping` | Mixed — see detail |
+| **Doctors / Slots** | `GET /v1/doctors`, `POST /v1/doctors/slots`, `GET /v1/doctors/{doctor_id}/slots` | Open / doctor+ |
+| **Bookings** | `POST /v1/bookings` | Patient (Bearer + `Idempotency-Key`) |
+| **Consultations** | `GET /v1/consultations`, `GET /v1/consultations/{cid}`, `POST /v1/consultations/{cid}/transition` | Owner / doctor / admin |
+| **Prescriptions** | `POST /v1/consultations/{cid}/prescriptions`, `GET /v1/prescriptions/{rx_id}`, `GET /v1/prescriptions/{rx_id}/pdf` | Treating parties |
+| **Payments** | `POST /v1/payments`, `POST /v1/payments/webhook` | Patient / gateway (`X-Webhook-Secret`) |
+| **Search** | `GET /v1/search/doctors` | Open |
+| **Analytics** | `GET /v1/analytics/daily`, `GET /v1/analytics/funnel` | Admin |
+
+<Note>
+  `POST /v1/payments/webhook` authenticates via the `X-Webhook-Secret` header instead of a Bearer token. The shared secret is configured via the `PAYMENT_WEBHOOK_SECRET` environment variable.
+</Note>
+
+## Explore by Group
+
+<CardGroup cols={2}>
+  <Card title="Authentication & MFA" icon="lock" href="/api/auth">
+    Register, login, MFA enroll/verify, token refresh, and the admin ping endpoint.
+  </Card>
+  <Card title="Doctors & Slots" icon="stethoscope" href="/api/doctors">
+    List available doctors, create availability slots, and retrieve slots for a specific doctor.
+  </Card>
+  <Card title="Bookings" icon="calendar-check" href="/api/bookings">
+    Idempotent slot booking with advisory locking and race-safe `202 + Location` responses.
+  </Card>
+  <Card title="Consultations" icon="notes-medical" href="/api/consultations">
+    List, retrieve, and drive the consultation lifecycle via `confirm → start → complete → cancel`.
+  </Card>
+  <Card title="Prescriptions" icon="prescription-bottle-medical" href="/api/prescriptions">
+    Issue AES-256-GCM sealed prescriptions and retrieve 5-minute presigned PDF download URLs.
+  </Card>
+  <Card title="Payments" icon="credit-card" href="/api/payments">
+    Initiate mock charges, handle webhook events, and trigger saga compensations on failure.
+  </Card>
+  <Card title="Search" icon="magnifying-glass" href="/api/search">
+    Full-text doctor search on the read replica with keyset cursor pagination.
+  </Card>
+  <Card title="Analytics" icon="chart-bar" href="/api/analytics">
+    Admin-only daily aggregates and funnel metrics for business intelligence dashboards.
+  </Card>
+  <Card title="Health & Metrics" icon="heart-pulse" href="/api/health">
+    Liveness, readiness, and Prometheus `/metrics` scraped per replica for RED dashboards.
+  </Card>
+  <Card title="Errors" icon="triangle-exclamation" href="/api/errors">
+    RFC 7807 Problem+JSON error format, status codes, error codes, and `trace_id` usage.
+  </Card>
+</CardGroup>

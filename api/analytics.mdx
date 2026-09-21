@@ -1,0 +1,167 @@
+---
+title: 'Analytics API: Daily Stats and Consultation Funnel'
+sidebarTitle: 'Analytics'
+description: 'Admin-only endpoints for daily consultation counts by status and funnel conversion across lifecycle states, read from materialized views on the replica.'
+---
+
+The analytics module exposes two admin-only aggregation endpoints that power operational dashboards. Both read from PostgreSQL **materialized views** (`analytics_daily` and `analytics_funnel`) on the read replica. The views are refreshed on a scheduler cron — not on every request — so data is pre-aggregated and fast to query regardless of the size of the `consultations` table.
+
+<Note>
+  Both endpoints read from the read replica. Materialized view refreshes happen on a background schedule, so data may lag up to **10 seconds** behind the primary. Do not use these endpoints for real-time billing or compliance decisions.
+</Note>
+
+## Authentication
+
+Both endpoints require a valid Bearer token issued to a user with the **`admin`** role. Requests without a token, or with a token for a `patient` or `doctor` role, receive `403 Forbidden`.
+
+```http
+Authorization: Bearer <admin-access-token>
+```
+
+---
+
+## Daily Consultation Counts
+
+```http
+GET /v1/analytics/daily
+```
+
+Returns daily consultation counts broken down by status for the past N days. Each row represents one `(day, status)` combination, so a single calendar day typically produces multiple rows — one for each status value that had activity on that day.
+
+The underlying query reads from the `analytics_daily` materialized view ordered by `day DESC`, giving the most recent data first.
+
+### Query Parameters
+
+<ParamField query="limit" type="integer" default="30">
+  The number of days to look back. Accepts values from 1 to 365 (one full year). Defaults to the last 30 days.
+</ParamField>
+
+### Response Fields
+
+Returns an array of `DailyRow` objects.
+
+<ResponseField name="day" type="string" required>
+  Calendar date in `YYYY-MM-DD` format (e.g. `"2024-06-01"`). Sourced from `day::text` cast in the materialized view.
+</ResponseField>
+
+<ResponseField name="status" type="string" required>
+  Consultation lifecycle status for this row (e.g. `"held"`, `"confirmed"`, `"in_progress"`, `"completed"`, `"cancelled"`).
+</ResponseField>
+
+<ResponseField name="n" type="integer" required>
+  Count of consultations in this `status` on this `day`.
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+
+```bash Fetch last 30 days (default)
+curl https://api.amrutam.example/v1/analytics/daily \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+```bash Fetch last 7 days
+curl "https://api.amrutam.example/v1/analytics/daily?limit=7" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+</CodeGroup>
+
+```json Response (excerpt)
+[
+  { "day": "2024-06-10", "status": "completed",   "n": 42 },
+  { "day": "2024-06-10", "status": "cancelled",   "n":  3 },
+  { "day": "2024-06-10", "status": "in_progress", "n":  7 },
+  { "day": "2024-06-09", "status": "completed",   "n": 39 },
+  { "day": "2024-06-09", "status": "confirmed",   "n": 11 }
+]
+```
+
+---
+
+## Consultation Funnel
+
+```http
+GET /v1/analytics/funnel
+```
+
+Returns the total count of consultations in each lifecycle status across all time, ordered by count descending. This gives a snapshot of the conversion funnel — how many consultations make it from initial hold through to completion, and where drop-off occurs.
+
+The typical funnel flow is:
+
+```text
+held → confirmed → in_progress → completed
+                ↘ cancelled
+```
+
+A large gap between `held` and `confirmed`, for example, signals that patients or doctors are not following through after a slot is reserved.
+
+### Query Parameters
+
+This endpoint accepts no query parameters.
+
+### Response Fields
+
+Returns an array of `FunnelRow` objects, sorted by `n` descending (highest volume status first).
+
+<ResponseField name="status" type="string" required>
+  Consultation lifecycle status (e.g. `"completed"`, `"held"`, `"cancelled"`).
+</ResponseField>
+
+<ResponseField name="n" type="integer" required>
+  Cumulative total count of consultations that have ever been in this status.
+</ResponseField>
+
+### Example
+
+<CodeGroup>
+
+```bash Fetch funnel data
+curl https://api.amrutam.example/v1/analytics/funnel \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+```
+
+</CodeGroup>
+
+```json Response
+[
+  { "status": "completed",   "n": 1840 },
+  { "status": "confirmed",   "n": 2103 },
+  { "status": "held",        "n": 2541 },
+  { "status": "in_progress", "n": 1912 },
+  { "status": "cancelled",   "n":  438 }
+]
+```
+
+<Tip>
+  Divide each stage count by the preceding stage to get conversion rate. In the example above, `held → confirmed` conversion is `2103 / 2541 ≈ 82.8 %`. A drop below 70 % may indicate booking friction worth investigating.
+</Tip>
+
+---
+
+## Error Responses
+
+<Accordion title="403 Forbidden — missing or insufficient role">
+  Returned when the Bearer token is absent, expired, or belongs to a non-admin user.
+
+  ```json
+  { "title": "forbidden", "trace_id": "abc123" }
+  ```
+</Accordion>
+
+<Accordion title="422 Unprocessable Entity — validation failure">
+  Returned if `limit` exceeds 365 on the `/daily` endpoint.
+
+  ```json
+  {
+    "detail": [
+      {
+        "loc": ["query", "limit"],
+        "msg": "Input should be less than or equal to 365",
+        "type": "less_than_equal"
+      }
+    ]
+  }
+  ```
+</Accordion>

@@ -1,0 +1,275 @@
+---
+title: "Security Architecture: PHI Protection and Audit Trail"
+sidebarTitle: "Security"
+description: "Argon2id passwords, RS256 JWT with refresh rotation, AES-256-GCM PHI encryption, chain-hash audit trail, and OWASP security headers across all layers."
+---
+
+Security in the Amrutam Telemedicine API is layered from the outermost edge inward: Nginx terminates TLS and applies coarse rate limits before a single byte reaches FastAPI, FastAPI enforces JWT authentication, RBAC, and input validation before any business logic runs, and PostgreSQL and MinIO store only hashed or encrypted sensitive data at rest. No single layer is trusted to be sufficient on its own — each boundary independently validates identity and intent.
+
+## Password Hashing
+
+All user passwords are hashed with **argon2id**, the winner of the Password Hashing Competition and the current OWASP recommendation for new systems. The parameters are deliberately calibrated to be expensive enough to resist offline dictionary attacks while remaining tolerable for interactive login:
+
+```python
+# src/amrutam/core/security.py
+from argon2 import PasswordHasher
+
+_ph = PasswordHasher(time_cost=3, memory_cost=65536, parallelism=2)
+
+def hash_password(password: str) -> str:
+    return _ph.hash(password)
+
+def verify_password(password_hash: str, password: str) -> bool:
+    try:
+        return _ph.verify(password_hash, password)
+    except VerifyMismatchError:
+        return False
+```
+
+<Info>
+`memory_cost=65536` is 64 MB per hash operation. `time_cost=3` means three passes through that memory. `parallelism=2` allows two threads. These values make a brute-force attack on a stolen hash database prohibitively expensive.
+</Info>
+
+## JWT Security: RS256 and Refresh Rotation
+
+The API issues access tokens signed with **RS256** (asymmetric RSA-SHA256), not the simpler HS256 symmetric scheme. This means any service can verify tokens using only the public key — the private key never needs to leave the signing service.
+
+```python
+# src/amrutam/core/security.py
+def create_access_token(user_id: str, role: str, settings: Settings | None = None) -> str:
+    settings = settings or get_settings()
+    priv, _ = _load_keys()
+    now = datetime.now(UTC)
+    payload = {
+        "sub": user_id,
+        "role": role,
+        "type": "access",
+        "iat": now,
+        "exp": now + timedelta(minutes=settings.jwt_access_ttl_min),
+    }
+    return jwt.encode(payload, priv, algorithm="RS256", headers={"kid": settings.jwt_kid})
+```
+
+<CardGroup cols={2}>
+  <Card title="Access Token" icon="clock">
+    15-minute lifetime. Short enough that a stolen token becomes useless quickly without requiring an online revocation check on every request.
+  </Card>
+  <Card title="Refresh Token" icon="rotate">
+    7-day lifetime, stored as a JTI in Redis. Consumed with `GETDEL` — any replay of an already-used refresh token returns `None` and must be rejected as a theft signal.
+  </Card>
+</CardGroup>
+
+Refresh rotation uses Redis `GETDEL` to make single-use tokens atomic:
+
+```python
+# src/amrutam/core/security.py
+async def consume_refresh(redis: Any, jti: str) -> str | None:
+    """GETDEL — returns user_id if valid, None if already used/missing (replay)."""
+    val = await redis.getdel(f"refresh:{jti}")
+    if isinstance(val, bytes):
+        return val.decode()
+    return val
+```
+
+Every token also carries a `kid` (key ID) header to support seamless key rotation without invalidating all live sessions.
+
+## TOTP Multi-Factor Authentication
+
+MFA follows **RFC 6238** (TOTP — Time-Based One-Time Passwords) implemented via `pyotp`. After successful password verification, users with `mfa_required=True` must supply a valid six-digit code from their authenticator app before an access token is issued.
+
+```python
+# src/amrutam/core/security.py
+def generate_mfa_secret() -> str:
+    return pyotp.random_base32()
+
+def get_otpauth_url(secret: str, email: str, issuer: str = "Amrutam") -> str:
+    return pyotp.totp.TOTP(secret).provisioning_uri(name=email, issuer_name=issuer)
+
+def verify_totp(secret: str, code: str) -> bool:
+    try:
+        return pyotp.TOTP(secret).verify(code, valid_window=1)
+    except Exception:
+        return False
+```
+
+`valid_window=1` permits one 30-second step of clock skew in either direction, which handles most client-server time drift without materially widening the attack surface.
+
+## PHI Encryption: AES-256-GCM Envelope
+
+Protected Health Information — diagnoses, prescriptions, and PDF attachments — is encrypted with **AES-256-GCM** before being written to PostgreSQL or MinIO. The scheme uses a two-key envelope:
+
+<Steps>
+  <Step title="Generate a Data Encryption Key (DEK)">
+    A fresh 256-bit DEK is generated for each prescription row. This ensures that compromise of one record's key does not affect any other record.
+  </Step>
+  <Step title="Encrypt the payload">
+    The PHI plaintext is encrypted with the DEK using AES-256-GCM. The ciphertext and the GCM authentication tag are stored in the database. The plaintext is never persisted.
+  </Step>
+  <Step title="Wrap the DEK with the KEK">
+    The DEK is encrypted (wrapped) with the Key Encryption Key (KEK) loaded from `PRESCRIPTION_KEK_B64`. Only the wrapped DEK is stored. In production this KEK reference should point to a managed KMS (AWS KMS, GCP CKMS, etc.).
+  </Step>
+  <Step title="Decrypt on read">
+    On read, the KEK unwraps the DEK, and the DEK decrypts the ciphertext. The plaintext exists only in memory during request handling.
+  </Step>
+</Steps>
+
+<Warning>
+The default `PRESCRIPTION_KEK_B64` in `.env.example` is a zero-key placeholder — **not a real secret**. Before any production deployment, replace this value with a strong random key or, better, a reference to a managed KMS key. A leaked KEK gives an attacker access to all PHI stored under it.
+</Warning>
+
+## Append-Only Chain-Hash Audit Trail
+
+Every mutation that passes through the API appends a row to `audit_logs`. Rows form a cryptographic chain: each row's `hash` is `sha256(prev_hash || actor || action || entity:entity_id || payload)`. This means that deleting or modifying any historical row breaks all subsequent hashes, making tampering immediately detectable.
+
+```python
+# src/amrutam/core/audit.py
+async def write_audit(
+    db: AsyncSession,
+    actor: str,
+    action: str,
+    entity: str,
+    entity_id: str,
+    payload: str | dict[str, Any],
+) -> str:
+    if isinstance(payload, dict):
+        payload = json.dumps(payload)
+    await db.execute(text("SELECT pg_advisory_xact_lock(hashtext('audit_chain'))"))
+    prev = (
+        await db.execute(text("SELECT hash FROM audit_logs ORDER BY ts DESC, id DESC LIMIT 1"))
+    ).first()
+    prev_hash = prev[0] if prev and prev[0] else ""
+    digest = hashlib.sha256(
+        f"{prev_hash}|{actor}|{action}|{entity}:{entity_id}|{payload}".encode()
+    ).hexdigest()
+    await db.execute(
+        text(
+            "INSERT INTO audit_logs (actor, action, entity, entity_id, payload, "
+            "prev_hash, hash) VALUES (:a, :act, :e, :eid, :pl, :ph, :h)"
+        ),
+        {"a": actor, "act": action, "e": entity, "eid": entity_id,
+         "pl": payload, "ph": prev_hash, "h": digest},
+    )
+    return digest
+```
+
+`pg_advisory_xact_lock` serializes all writers within the same PostgreSQL session, ensuring no two concurrent transactions can fork the chain. The `AuditMiddleware` class wraps every non-read HTTP request automatically — services do not need to call `write_audit` manually for HTTP-level auditing:
+
+```python
+# src/amrutam/api/middleware/audit.py
+SKIP_PREFIXES = ("/health", "/ready", "/docs", "/redoc", "/openapi.json")
+
+def _should_audit(request: Request) -> bool:
+    if request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+        return False
+    return not request.url.path.startswith(SKIP_PREFIXES)
+```
+
+<Note>
+In production, apply `REVOKE UPDATE DELETE ON audit_logs FROM app_role` at the database level. The advisory lock prevents chain forks but does not prevent a compromised application credential from issuing direct `UPDATE` statements. The database-level `REVOKE` removes that vector entirely.
+</Note>
+
+## Security Headers and CORS
+
+Nginx adds all three mandatory OWASP security headers on every response:
+
+```nginx
+# infra/nginx/amrutam.conf
+add_header Strict-Transport-Security "max-age=63072000" always;
+add_header X-Content-Type-Options nosniff always;
+add_header X-Frame-Options DENY always;
+```
+
+<Accordion title="What each header does">
+  **`Strict-Transport-Security`** (HSTS) — instructs browsers to refuse plain HTTP connections for two years (`63072000` seconds). This prevents SSL-stripping attacks.
+
+  **`X-Content-Type-Options: nosniff`** — stops browsers from MIME-sniffing a response away from the declared `Content-Type`, closing a class of content-injection attacks.
+
+  **`X-Frame-Options: DENY`** — prevents the API from being embedded in an `<iframe>` on any origin, blocking clickjacking.
+</Accordion>
+
+CORS is configured with an explicit allowlist of origins — wildcard `*` is never used in production. All API traffic is further protected by TLS 1.2/1.3 at the Nginx edge (`ssl_protocols TLSv1.2 TLSv1.3; ssl_ciphers HIGH:!aNULL:!MD5`).
+
+## RFC 7807 Problem+JSON Error Responses
+
+All errors are returned as `application/problem+json` with a consistent structure. Stack traces, internal exception messages, and SQL details are never included in error responses:
+
+```python
+# src/amrutam/core/errors.py
+class AppError(Exception):
+    status: int = 500
+    title: str = "internal_error"
+    code: str = "internal_error"
+
+    def to_response(self, trace_id: str = "") -> Response:
+        body = {
+            "title": self.title,
+            "detail": self.detail,
+            "code": self.code,
+            "trace_id": trace_id,
+            **self.extra,
+        }
+        return Response(
+            status_code=self.status,
+            media_type="application/problem+json",
+            content=json.dumps(body),
+        )
+```
+
+A client receiving an error always gets a stable `code` field to match on, a human-readable `detail`, and a `trace_id` that can be correlated against the structured logs — but nothing that reveals internal implementation details.
+
+## Input Validation and RBAC
+
+Pydantic models use `extra="forbid"` (strict mode) so that unexpected fields in request bodies are rejected immediately with a `400 Bad Request` rather than silently ignored. All database queries use bound parameters (`sqlalchemy.text` with a parameter dict), eliminating SQL injection as an attack vector.
+
+Role-based access control is applied at the route level on every protected endpoint. Ownership checks enforce that a patient can only read their own bookings, a doctor can only see their own consultations, and admin-only routes return `403 Forbidden` for any other role.
+
+## CI Security Gates
+
+The CI pipeline enforces quality gates on every push and pull request:
+
+```yaml
+# .github/workflows/ci.yml
+- run: ruff check src tests
+- run: black --check src tests
+- run: mypy src
+```
+
+<CardGroup cols={2}>
+  <Card title="Static Analysis" icon="magnifying-glass">
+    `ruff` catches common security anti-patterns (e.g. `BLE001` bare-except swallowing errors) and enforces import hygiene. `mypy --strict` eliminates an entire class of runtime type confusion bugs.
+  </Card>
+  <Card title="Recommended Pre-Prod Gates" icon="shield-check">
+    `bandit` for Python security linting, `pip-audit` for known CVEs in dependencies, `trivy` for container image vulnerabilities, and SBOM generation with `cosign` signing.
+  </Card>
+</CardGroup>
+
+## Production Security Checklist
+
+The following items are confirmed complete for the current build:
+
+<Accordion title="Completed security controls">
+  - Argon2id passwords (`time_cost=3, memory=64 MB, parallelism=2`)
+  - JWT RS256, access 15 min, refresh 7 d with reuse detection and `kid`
+  - TOTP MFA (RFC 6238) with `mfa_required` gate
+  - RBAC on all routes with ownership checks; admin-only analytics
+  - PHI AES-256-GCM envelope (DEK per row, KEK from env → KMS)
+  - Append-only chain-hash audit with advisory-locked writers; middleware covers all mutations
+  - Edge (Nginx `limit_req`) and app-level (Redis token bucket) rate limits
+  - HSTS, `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, CORS allowlist
+  - Pydantic strict validation, bound SQL parameters, Problem+JSON errors without leaks
+  - Idempotency-Key enforced on writes (replay-safe retries)
+  - Secrets via environment; RS256 pair via `jwt-secrets` volume; never committed
+  - CI: `ruff` + `black` + `mypy --strict`; 23 tests green
+</Accordion>
+
+<Accordion title="Production TODOs (from security_checklist.md)">
+  The following controls are **required before a public production deployment** and are not present in the compose demo:
+
+  - **Managed KMS** — replace `PRESCRIPTION_KEK_B64` with an AWS KMS / GCP CKMS reference
+  - **WAF ruleset** — deploy NAXSI or ModSecurity in front of Nginx
+  - **Real TLS certificates** — replace self-signed certs with ACM or Let's Encrypt
+  - **Audit table grants** — `REVOKE UPDATE DELETE ON audit_logs FROM app_role` in the database
+  - **PgBouncer** — connection pooler to prevent pool exhaustion under load
+  - **Multi-AZ** — promote the demo single-region compose deployment to multi-availability-zone managed infrastructure
+  - **SBOM and cosign signing** — at image build time for supply-chain integrity
+</Accordion>

@@ -1,0 +1,240 @@
+---
+title: "Environment Variables and Configuration Reference"
+sidebarTitle: "Environment"
+description: "Complete reference for all Amrutam environment variables: database, Redis, S3, JWT key paths, prescription KEK, webhook secret, and OTel tracing knobs."
+---
+
+All runtime configuration for the Amrutam backend is supplied through environment variables loaded by [Pydantic Settings](https://docs.pydantic.dev/latest/concepts/pydantic_settings/). In a Docker Compose deployment the variables live in a `.env` file that you copy from `.env.example`; in production they should be injected by your secrets manager (Vault, AWS Secrets Manager, Docker secrets, or Kubernetes Secrets) so that no secret ever touches the filesystem or a version-control history.
+
+<Warning>
+  The default value `AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=` for
+  `PRESCRIPTION_KEK_B64` is a **zero-key placeholder** committed only for local
+  development and automated tests. It provides **no security whatsoever**. Before
+  accepting any real patient data you must generate a cryptographically random
+  32-byte key (`openssl rand -base64 32`), store it in your secrets manager, and
+  rotate the old KEK using the re-encryption runbook in `docs/security_checklist.md`.
+</Warning>
+
+## Getting started
+
+```bash
+cp .env.example .env
+# Open .env and replace every placeholder value before starting services
+```
+
+The `.env` file is already listed in `.gitignore`. Never commit it.
+
+---
+
+## Database
+
+<ParamField body="DATABASE_URL" type="string" required>
+  Async SQLAlchemy URL for the PostgreSQL **primary** (read-write) node. All
+  writes, booking transactions, and migrations target this connection.
+
+  ```
+  postgresql+asyncpg://amrutam:amrutam@postgres-primary:5432/amrutam
+  ```
+</ParamField>
+
+<ParamField body="REPLICA_DATABASE_URL" type="string" required>
+  Async SQLAlchemy URL for the PostgreSQL **replica** (read-only) node. Used by
+  the `/v1/search/doctors` keyset cursor and the `/v1/analytics/*` aggregations to
+  keep heavy reads off the primary.
+
+  ```
+  postgresql+asyncpg://amrutam:amrutam@postgres-replica:5432/amrutam
+  ```
+</ParamField>
+
+<ParamField body="POSTGRES_PASSWORD" type="string" default="amrutam">
+  Plain-text password embedded in `DATABASE_URL`. In production, prefer the
+  `POSTGRES_PASSWORD_FILE` Docker secret variant so the value is never visible in
+  environment listings (`docker inspect`, `/proc/<pid>/environ`).
+</ParamField>
+
+---
+
+## Redis
+
+<ParamField body="REDIS_URL" type="string" default="redis://redis:6379/0">
+  Connection URL for Redis 7. Redis serves four distinct roles in the platform:
+  idempotency-key replay cache, token bucket rate-limit counters, outbox event
+  streams, and refresh-token JTI allow-list. All four roles share database `0`
+  by default; you can separate them onto different logical databases or cluster
+  shards in production.
+</ParamField>
+
+---
+
+## Object Storage
+
+<ParamField body="S3_ENDPOINT" type="string" default="http://minio:9000">
+  Base URL of the S3-compatible object store. In the Compose stack this points to
+  the bundled MinIO container. For AWS S3 set this to the regional endpoint, e.g.
+  `https://s3.ap-south-1.amazonaws.com`.
+</ParamField>
+
+<ParamField body="S3_ACCESS_KEY" type="string" default="minioadmin">
+  Access key (equivalent to AWS `AWS_ACCESS_KEY_ID`). In production use an IAM
+  role or a scoped MinIO service account rather than the root credential.
+</ParamField>
+
+<ParamField body="S3_SECRET_KEY" type="string" default="minioadmin">
+  Secret key (equivalent to AWS `AWS_SECRET_ACCESS_KEY`). Treat this value with
+  the same care as a database password — never log it or expose it in HTTP
+  responses.
+</ParamField>
+
+<ParamField body="S3_BUCKET" type="string" default="rx-pdfs">
+  Name of the bucket where sealed prescription PDFs are stored. Each prescription
+  is written as `prescriptions/{prescription_id}.pdf`; download links are
+  5-minute presigned S3 URLs returned by `GET /v1/prescriptions/{id}/pdf`.
+</ParamField>
+
+---
+
+## JWT
+
+<ParamField body="JWT_PRIVATE_KEY_PATH" type="string" default="/run/secrets/jwt_private.pem">
+  Filesystem path to the RS256 private PEM key used to **sign** access and
+  refresh tokens. In the Compose stack the `entrypoint.sh` generates a 2048-bit
+  RSA key pair on first start and writes it to the `jwt-secrets` named volume,
+  which is mounted at `/run/secrets` across all API replicas.
+</ParamField>
+
+<ParamField body="JWT_PUBLIC_KEY_PATH" type="string" default="/run/secrets/jwt_public.pem">
+  Filesystem path to the RS256 public PEM key used to **verify** tokens. Must be
+  the corresponding public key for `JWT_PRIVATE_KEY_PATH`. In a Kubernetes
+  deployment, mount both keys from the same Secret object.
+</ParamField>
+
+<ParamField body="JWT_KID" type="string" default="local-1">
+  Key ID (`kid`) embedded in every JWT header. When you rotate the signing key
+  pair, change this value so token-verification middleware can select the correct
+  public key from a JWKS endpoint or in-memory cache.
+</ParamField>
+
+<ParamField body="JWT_ACCESS_TTL_MIN" type="integer" default="15">
+  Lifetime of access tokens in **minutes**. The default 15 minutes follows
+  OWASP guidance for short-lived bearer tokens. Patients and doctors will be
+  prompted to refresh via the `/v1/auth/refresh` endpoint before expiry.
+</ParamField>
+
+<ParamField body="JWT_REFRESH_TTL_DAYS" type="integer" default="7">
+  Lifetime of refresh tokens in **days**. Refresh tokens are stored as opaque
+  JTIs in Redis; the platform performs single-use rotation with reuse detection —
+  a replay of a consumed refresh token immediately revokes the entire session.
+</ParamField>
+
+---
+
+## Security
+
+<ParamField body="PRESCRIPTION_KEK_B64" type="string" required>
+  Base64-encoded 32-byte **Key Encryption Key** (KEK) for the AES-256-GCM
+  envelope encryption applied to prescription payloads. Each prescription row
+  gets its own random Data Encryption Key (DEK) which is wrapped by this KEK
+  before being stored alongside the ciphertext.
+
+  Generate a production value:
+  ```bash
+  openssl rand -base64 32
+  ```
+
+  In production the KEK should live in a Hardware Security Module or a managed
+  KMS (AWS KMS, GCP Cloud KMS, HashiCorp Vault Transit). The application reads
+  the wrapped DEK, calls KMS to unwrap, then decrypts the payload in memory.
+</ParamField>
+
+<ParamField body="PAYMENT_WEBHOOK_SECRET" type="string" default="local-webhook-secret">
+  Shared HMAC secret validated on every inbound payment webhook via the
+  `X-Webhook-Secret` request header (`POST /v1/payments/webhook`). The API
+  returns `403` immediately if the header is absent or does not match. Rotate
+  this value whenever you rotate your payment gateway credentials.
+</ParamField>
+
+---
+
+## Observability
+
+<ParamField body="OTEL_EXPORTER_OTLP_ENDPOINT" type="string" default="http://otel-collector:4317">
+  gRPC endpoint of the OpenTelemetry collector. The SDK exports spans via
+  `BatchSpanProcessor` over this address. Connection failures are silently
+  swallowed so the API never becomes unavailable just because the collector is
+  temporarily down.
+</ParamField>
+
+<ParamField body="OTEL_ENABLED" type="boolean" default="false">
+  Set to `true` to activate FastAPI, AsyncPG, and Redis auto-instrumentation.
+  Leave `false` for plain local runs and unit tests that do not start the OTel
+  collector, otherwise every request will log a connection-refused warning.
+
+  In `docker-compose.yml` this is hard-coded to `"true"` for the `api` service so
+  that the full observability stack is exercised in any Compose deployment.
+</ParamField>
+
+<ParamField body="LOG_LEVEL" type="string" default="INFO">
+  Structlog minimum log level. Valid values are `DEBUG`, `INFO`, `WARNING`,
+  `ERROR`, and `CRITICAL`. All log records are emitted as JSON on stdout and
+  scraped by the Loki container. Set `DEBUG` only in development — at scale the
+  volume of debug records can saturate the Loki ingestion buffer.
+</ParamField>
+
+---
+
+## Additional application variables
+
+<ParamField body="APP_NAME" type="string" default="amrutam">
+  Application name embedded in structured log records and the OTel
+  `service.name` resource attribute.
+</ParamField>
+
+<ParamField body="APP_ENV" type="string" default="local">
+  Deployment environment tag (`local`, `staging`, `production`). Used in log
+  records and can gate environment-specific behaviour such as Swagger UI
+  availability.
+</ParamField>
+
+<ParamField body="API_V1_PREFIX" type="string" default="/v1">
+  URL prefix for all versioned routes. Change only if you need to host multiple
+  API versions behind a single ingress.
+</ParamField>
+
+---
+
+## Minimal local `.env`
+
+The snippet below is the smallest set of overrides needed to start the Compose
+stack on a developer laptop. Every value here should be treated as a **dev-only
+secret** and replaced before any production deployment.
+
+```ini
+# .env — local development only, never commit
+APP_ENV=local
+LOG_LEVEL=INFO
+
+DATABASE_URL=postgresql+asyncpg://amrutam:amrutam@postgres-primary:5432/amrutam
+REPLICA_DATABASE_URL=postgresql+asyncpg://amrutam:amrutam@postgres-replica:5432/amrutam
+POSTGRES_PASSWORD=amrutam
+
+REDIS_URL=redis://redis:6379/0
+
+S3_ENDPOINT=http://minio:9000
+S3_ACCESS_KEY=minioadmin
+S3_SECRET_KEY=minioadmin
+S3_BUCKET=rx-pdfs
+
+JWT_PRIVATE_KEY_PATH=/run/secrets/jwt_private.pem
+JWT_PUBLIC_KEY_PATH=/run/secrets/jwt_public.pem
+JWT_KID=local-1
+JWT_ACCESS_TTL_MIN=15
+JWT_REFRESH_TTL_DAYS=7
+
+# ⚠ Replace before going live
+PRESCRIPTION_KEK_B64=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=
+PAYMENT_WEBHOOK_SECRET=local-webhook-secret
+
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4317
+OTEL_ENABLED=false
+```

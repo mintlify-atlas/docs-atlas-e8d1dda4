@@ -1,0 +1,244 @@
+---
+title: "Authenticate Requests with JWT and TOTP MFA"
+sidebarTitle: "Authentication"
+description: "RS256 JWT access tokens (15 min TTL), 7-day rotating refresh tokens, argon2id passwords, TOTP MFA enrollment, and three-role RBAC enforced at every endpoint."
+---
+
+The Amrutam API uses a layered authentication model: passwords are hashed with **argon2id** (time-cost 3, 64 MB memory), identity is asserted via **RS256-signed JWTs**, short-lived access tokens are paired with rotating refresh tokens backed by Redis, and an optional **RFC 6238 TOTP MFA** layer can be enrolled per account. All role enforcement happens in the `require_role()` FastAPI dependency before any business logic runs.
+
+## Token Architecture
+
+Every successful login produces a **token pair**:
+
+| Token | Algorithm | TTL | Storage |
+|---|---|---|---|
+| `access_token` | RS256 JWT | 15 minutes (`jwt_access_ttl_min`) | Memory / header |
+| `refresh_token` | RS256 JWT (contains `jti`) | 7 days (`jwt_refresh_ttl_days`) | Secure cookie or client store |
+
+Refresh tokens are single-use. The `jti` (unique identifier) is stored in Redis as `refresh:{jti} → user_id`. Rotation calls `GETDEL` — if the key is already gone the token is considered **replayed** and a `401 refresh_reused` error is raised. This prevents token-theft replay attacks.
+
+<Note>
+  Never commit `.env` files containing `JWT_PRIVATE_KEY_PATH` or the PEM key content. In production, mount the RS256 key pair via `/run/secrets` or a KMS-backed secret manager. The dev fallback generates an **ephemeral in-memory key** that changes on every restart and invalidates all existing tokens.
+</Note>
+
+## Roles and Access
+
+Three roles are supported. Registration accepts `patient` or `doctor` — `admin` must be set directly in the database.
+
+<CardGroup cols={3}>
+  <Card title="patient" icon="user">
+    Book slots, view own consultations, pay for bookings, read own prescriptions.
+  </Card>
+  <Card title="doctor" icon="stethoscope">
+    View assigned consultations, drive clinical state transitions, issue prescriptions.
+  </Card>
+  <Card title="admin" icon="shield">
+    Full access to all resources. Can probe the `GET /v1/auth/admin/ping` route.
+  </Card>
+</CardGroup>
+
+## Registration
+
+Send a `POST /v1/auth/register` request. `specialization` and `license_no` are **required** when `role` is `doctor`.
+
+<Tabs>
+  <Tab title="Request Schema">
+    <ParamField body="email" type="string" required>
+      Valid email address, 5–255 characters.
+    </ParamField>
+    <ParamField body="password" type="string" required>
+      8–128 characters. Hashed with argon2id before storage.
+    </ParamField>
+    <ParamField body="role" type="string" default="patient">
+      `"patient"` or `"doctor"`. Defaults to `"patient"`.
+    </ParamField>
+    <ParamField body="full_name" type="string" required>
+      1–200 characters.
+    </ParamField>
+    <ParamField body="phone" type="string">
+      Optional. Up to 20 characters.
+    </ParamField>
+    <ParamField body="specialization" type="string">
+      Required for doctors. Up to 120 characters.
+    </ParamField>
+    <ParamField body="license_no" type="string">
+      Required for doctors. Up to 64 characters.
+    </ParamField>
+  </Tab>
+  <Tab title="cURL">
+    ```bash
+    curl -s -X POST https://api.example.com/v1/auth/register \
+      -H "Content-Type: application/json" \
+      -d '{
+        "email": "priya@example.com",
+        "password": "correct-horse-battery",
+        "role": "patient",
+        "full_name": "Priya Sharma"
+      }'
+    ```
+  </Tab>
+  <Tab title="Response">
+    ```json
+    {
+      "id": "018f4e2a-1234-7abc-89de-000000000001",
+      "email": "priya@example.com",
+      "role": "patient"
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Login
+
+`POST /v1/auth/login` verifies the password and, if MFA is enrolled, the TOTP code. On success it returns a `TokenPair`.
+
+<Tabs>
+  <Tab title="Request Schema">
+    <ParamField body="email" type="string" required>
+      Registered email address.
+    </ParamField>
+    <ParamField body="password" type="string" required>
+      Account password.
+    </ParamField>
+    <ParamField body="totp_code" type="string">
+      6–8 digit TOTP code. Required only when MFA is enrolled. Omitting it on an MFA-enabled account returns `401 mfa_required`.
+    </ParamField>
+  </Tab>
+  <Tab title="cURL">
+    ```bash
+    curl -s -X POST https://api.example.com/v1/auth/login \
+      -H "Content-Type: application/json" \
+      -d '{
+        "email": "priya@example.com",
+        "password": "correct-horse-battery"
+      }'
+    ```
+  </Tab>
+  <Tab title="Response">
+    ```json
+    {
+      "access_token": "eyJhbGciOiJSUzI1NiIsImtpZCI6InYxIn0...",
+      "refresh_token": "eyJhbGciOiJSUzI1NiIsImtpZCI6InYxIn0...",
+      "token_type": "bearer"
+    }
+    ```
+  </Tab>
+</Tabs>
+
+## Authenticating Requests
+
+Include the access token in every protected request:
+
+```http
+Authorization: Bearer <access_token>
+```
+
+```bash
+curl -s https://api.example.com/v1/consultations \
+  -H "Authorization: Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6InYxIn0..."
+```
+
+The `get_current_user` dependency decodes the JWT with the RS256 public key, validates `exp` and `sub`, and confirms the user record is still active in Postgres before handing the request to the route handler.
+
+## Token Refresh
+
+Access tokens expire after 15 minutes. Exchange the refresh token for a new pair:
+
+<Tabs>
+  <Tab title="cURL">
+    ```bash
+    curl -s -X POST https://api.example.com/v1/auth/refresh \
+      -H "Content-Type: application/json" \
+      -d '{"refresh_token": "eyJhbGciOiJSUzI1NiIsImtpZCI6InYxIn0..."}'
+    ```
+  </Tab>
+  <Tab title="Response">
+    ```json
+    {
+      "access_token": "eyJhbGciOiJSUzI1NiIsImtpZCI6InYxIn0...",
+      "refresh_token": "eyJhbGciOiJSUzI1NiIsImtpZCI6InYxIn0...",
+      "token_type": "bearer"
+    }
+    ```
+  </Tab>
+</Tabs>
+
+<Warning>
+  Each refresh token is **consumed on first use** via Redis `GETDEL`. Sending the same refresh token twice returns `401 refresh_reused`. Store the new `refresh_token` from every response immediately.
+</Warning>
+
+## TOTP MFA
+
+MFA is optional per account. Once enrolled, all subsequent logins require a valid TOTP code.
+
+<Steps>
+  <Step title="Enroll">
+    Call `POST /v1/auth/mfa/enroll` with a valid access token. The response contains a `secret` (Base32) and an `otpauth_url` suitable for import into any RFC 6238 authenticator app (Google Authenticator, Authy, 1Password, etc.).
+
+    ```bash
+    curl -s -X POST https://api.example.com/v1/auth/mfa/enroll \
+      -H "Authorization: Bearer <access_token>"
+    ```
+
+    ```json
+    {
+      "secret": "JBSWY3DPEHPK3PXP",
+      "otpauth_url": "otpauth://totp/Amrutam:priya%40example.com?secret=JBSWY3DPEHPK3PXP&issuer=Amrutam"
+    }
+    ```
+
+    Scan the `otpauth_url` with your authenticator app or enter the `secret` manually.
+  </Step>
+  <Step title="Verify">
+    Confirm enrollment by verifying the first code. This also activates MFA for subsequent logins.
+
+    ```bash
+    curl -s -X POST https://api.example.com/v1/auth/mfa/verify \
+      -H "Authorization: Bearer <access_token>" \
+      -H "Content-Type: application/json" \
+      -d '{"code": "123456"}'
+    ```
+
+    ```json
+    { "verified": true }
+    ```
+  </Step>
+  <Step title="Login with MFA">
+    All future logins must include `totp_code` in the login request body.
+
+    ```bash
+    curl -s -X POST https://api.example.com/v1/auth/login \
+      -H "Content-Type: application/json" \
+      -d '{
+        "email": "priya@example.com",
+        "password": "correct-horse-battery",
+        "totp_code": "123456"
+      }'
+    ```
+  </Step>
+</Steps>
+
+The TOTP verifier accepts a `valid_window=1` (one 30-second window of drift in either direction) to accommodate minor clock skew between client and server.
+
+## RBAC Enforcement
+
+The `require_role()` dependency in `src/amrutam/api/deps.py` is applied at the router level:
+
+```python
+# Only admins reach this route
+@router.get("/admin/ping")
+async def admin_ping(_: AuthUser = Depends(require_role("admin"))) -> dict[str, str]:
+    return {"status": "admin-ok"}
+```
+
+If the authenticated user's role is not in the required set, the dependency raises `403 Forbidden` before the route handler executes. Ownership checks (e.g. a patient reading another patient's consultation) are an additional layer inside the service and also raise `403`.
+
+## Error Reference
+
+| Status | Code | Meaning |
+|---|---|---|
+| `401` | — | Missing or expired bearer token |
+| `401` | `mfa_required` | MFA enrolled but `totp_code` absent or wrong |
+| `401` | `refresh_reused` | Refresh token already consumed (possible token theft) |
+| `403` | — | Authenticated but insufficient role or ownership violation |
+| `409` | `already_exists` | Email already registered |

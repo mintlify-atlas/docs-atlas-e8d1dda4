@@ -1,0 +1,187 @@
+---
+title: 'Health Endpoints: Liveness, Readiness, and Metrics'
+sidebarTitle: 'Health'
+description: 'Unauthenticated liveness probe at /health, dependency-aware readiness probe at /ready, and per-replica Prometheus metrics scrape endpoint at /metrics.'
+---
+
+The Amrutam API exposes three operational endpoints that are intentionally unversioned — they live at the root of the service, not under `/v1`. All three are unauthenticated so that load balancers, Kubernetes probes, and Prometheus scrapers can reach them without tokens. They are registered via `health_router` in `main.py` before any versioned routers, ensuring they remain reachable even during startup.
+
+<Warning>
+  The `/metrics` endpoint exposes internal counters and histogram data that could reveal traffic patterns or error rates. It should **never** be publicly accessible — see the firewall note below.
+</Warning>
+
+---
+
+## Liveness Probe
+
+```http
+GET /health
+```
+
+A minimal liveness check that returns `200 OK` as long as the Python process is alive and the event loop is healthy. This endpoint has no external dependencies — it does not query Postgres or Redis — so it will always return quickly.
+
+The Nginx upstream configuration uses `max_fails=3` to evict replicas that repeatedly fail this probe. A `200` response body is:
+
+```json
+{ "status": "ok" }
+```
+
+### Usage
+
+<Steps>
+  <Step title="Nginx upstream health check">
+    Point the `health_check` directive at `/health`. A replica is marked down after 3 consecutive failures and re-added after the first subsequent success.
+  </Step>
+  <Step title="Docker HEALTHCHECK">
+    Use `CMD curl -f http://localhost:8000/health || exit 1` in your `Dockerfile` to keep container restarts aligned with process health.
+  </Step>
+  <Step title="Kubernetes livenessProbe">
+    Set `path: /health` and `periodSeconds: 10`. A failed liveness probe triggers a pod restart — use this alongside the readiness probe below for a full two-probe setup.
+  </Step>
+</Steps>
+
+<CodeGroup>
+
+```bash curl
+curl -i https://api.amrutam.example/health
+```
+
+```http Response
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"status": "ok"}
+```
+
+</CodeGroup>
+
+---
+
+## Readiness Probe
+
+```http
+GET /ready
+```
+
+A readiness probe that signals whether the replica is ready to accept traffic. Unlike the liveness probe, readiness checks that upstream dependencies — PostgreSQL and Redis — are reachable before returning `200`. If any dependency is unavailable, the endpoint returns `503 Service Unavailable`, causing Kubernetes to stop routing new requests to that replica until the dependency recovers.
+
+<Info>
+  The current implementation is a shallow readiness check. Dependency pings (PG + Redis via `container.health()`) are introduced in Day 2 of the rollout. The endpoint will return `{"status": "ready"}` in both healthy and degraded states until that check is wired in — monitor the structured logs for upstream errors in the interim.
+</Info>
+
+A healthy `200` response body is:
+
+```json
+{ "status": "ready" }
+```
+
+### Kubernetes Configuration
+
+```yaml
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 8000
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  failureThreshold: 3
+```
+
+<CodeGroup>
+
+```bash curl
+curl -i https://api.amrutam.example/ready
+```
+
+```http 200 — replica ready
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{"status": "ready"}
+```
+
+```http 503 — dependency down
+HTTP/1.1 503 Service Unavailable
+Content-Type: application/json
+
+{"status": "unavailable"}
+```
+
+</CodeGroup>
+
+---
+
+## Prometheus Metrics
+
+```http
+GET /metrics
+```
+
+Exposes Prometheus text-format metrics for this replica. The endpoint is served by [`prometheus-fastapi-instrumentator`](https://github.com/trallnag/prometheus-fastapi-instrumentator) and mounted at `/metrics` via `setup_metrics(app)` in `observability.py`. Because metrics are stored in-process, **each replica maintains its own counters** — your Prometheus scrape config must target every pod individually, not a single load-balanced VIP.
+
+### Exposed Metrics
+
+<CardGroup cols={2}>
+  <Card title="RED Histograms" icon="chart-bar">
+    Per-route request rate, error rate, and duration histograms automatically instrumented by `prometheus-fastapi-instrumentator` for every registered FastAPI route.
+  </Card>
+  <Card title="bookings_total" icon="calendar-check">
+    Counter with a `status` label. Incremented each time a booking is created, labelled with the resulting booking status.
+  </Card>
+  <Card title="payments_total" icon="credit-card">
+    Counter with a `status` label. Incremented on each payment settlement event, labelled `paid` or `failed`.
+  </Card>
+  <Card title="idempotency_replays_total" icon="rotate">
+    Counter incremented every time an idempotent request is served from the Redis cache rather than re-executed.
+  </Card>
+  <Card title="outbox_relayed_total" icon="paper-plane">
+    Counter with an `event` label. Incremented by the outbox worker each time a domain event is successfully relayed to the stream.
+  </Card>
+</CardGroup>
+
+### Example Scrape Output
+
+```text
+# HELP bookings_total Bookings created
+# TYPE bookings_total counter
+bookings_total{status="held"} 2541.0
+bookings_total{status="cancelled"} 438.0
+
+# HELP payments_total Payments settled
+# TYPE payments_total counter
+payments_total{status="paid"} 1840.0
+payments_total{status="failed"} 63.0
+
+# HELP idempotency_replays_total Idempotent replays served from cache
+# TYPE idempotency_replays_total counter
+idempotency_replays_total 204.0
+
+# HELP outbox_relayed_total Outbox events relayed to stream
+# TYPE outbox_relayed_total counter
+outbox_relayed_total{event="booking_created"} 2541.0
+outbox_relayed_total{event="payment_settled"} 1903.0
+
+# HELP http_request_duration_seconds HTTP request duration in seconds
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{handler="/v1/search/doctors",le="0.01"} 4821
+http_request_duration_seconds_bucket{handler="/v1/search/doctors",le="0.05"} 5100
+```
+
+### Prometheus Scrape Configuration
+
+```yaml
+scrape_configs:
+  - job_name: amrutam-api
+    # Target each pod directly — do NOT point at the load balancer.
+    static_configs:
+      - targets:
+          - pod-0.amrutam-api.default.svc.cluster.local:8000
+          - pod-1.amrutam-api.default.svc.cluster.local:8000
+          - pod-2.amrutam-api.default.svc.cluster.local:8000
+    metrics_path: /metrics
+    scheme: http
+```
+
+<Tip>
+  Place the `/metrics` endpoint behind a network firewall rule or Kubernetes `NetworkPolicy` that allows inbound traffic **only from your Prometheus server's pod CIDR**. The endpoint is not rate-limited and is not intended for consumption by end users or third-party integrations.
+</Tip>

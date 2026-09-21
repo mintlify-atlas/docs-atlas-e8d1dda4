@@ -1,0 +1,333 @@
+---
+title: 'Auth API: Register, Login, MFA, and Token Refresh'
+sidebarTitle: 'Auth'
+description: 'Complete reference for authentication endpoints: register, login, JWT token refresh, TOTP MFA enrollment and verification, and current-user identity.'
+---
+
+The Auth API handles the full identity lifecycle for the Amrutam Telemedicine platform. All endpoints live under the `/v1/auth` prefix. Public endpoints (`/register`, `/login`, `/refresh`) require no credentials. Protected endpoints require a valid `Bearer` JWT in the `Authorization` header, obtained from `/login`. Role-scoped endpoints additionally enforce that the caller holds a specific role — `admin` in the case of `/admin/ping`.
+
+<Info>
+  Tokens are **JWT-based**. Access tokens are short-lived; refresh tokens are stored in Redis and are single-use — each call to `/refresh` invalidates the presented token and issues a fresh pair.
+</Info>
+
+---
+
+#### POST /v1/auth/register
+
+Creates a new user account and returns the basic identity record. The endpoint returns `201 Created` on success. No authentication is required.
+
+Doctors must supply `specialization` and `license_no`; omitting either for a `doctor` role returns `400 Bad Request`. The `role` field accepts only `"patient"` or `"doctor"` — the `admin` role is provisioned out-of-band.
+
+**Request body**
+
+<ParamField body="email" type="string" required>
+  Valid e-mail address, 5–255 characters. Must match pattern `^[^@\s]+@[^@\s]+\.[^@\s]+$`. Duplicate addresses return `409 Conflict`.
+</ParamField>
+
+<ParamField body="password" type="string" required>
+  Plain-text password, 8–128 characters. Stored as a bcrypt hash — never returned.
+</ParamField>
+
+<ParamField body="full_name" type="string" required>
+  Display name, 1–200 characters.
+</ParamField>
+
+<ParamField body="role" type="string" default="patient">
+  Account role. One of `"patient"` or `"doctor"`. Defaults to `"patient"`.
+</ParamField>
+
+<ParamField body="phone" type="string">
+  Optional phone number, up to 20 characters.
+</ParamField>
+
+<ParamField body="specialization" type="string">
+  Medical specialization, up to 120 characters. **Required when `role` is `"doctor"`.**
+</ParamField>
+
+<ParamField body="license_no" type="string">
+  Medical licence number, up to 64 characters. **Required when `role` is `"doctor"`.**
+</ParamField>
+
+**Response — `201 Created`**
+
+<ResponseField name="id" type="string">
+  UUID of the newly created user.
+</ResponseField>
+
+<ResponseField name="email" type="string">
+  The registered e-mail address.
+</ResponseField>
+
+<ResponseField name="role" type="string">
+  The role assigned at registration: `"patient"` or `"doctor"`.
+</ResponseField>
+
+<CodeGroup>
+```bash Register as patient
+curl -s -X POST https://api.amrutam.example/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "alice@example.com",
+    "password": "S3cur3P@ss!",
+    "full_name": "Alice Sharma",
+    "role": "patient"
+  }'
+```
+
+```bash Register as doctor
+curl -s -X POST https://api.amrutam.example/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "dr.mehta@example.com",
+    "password": "S3cur3P@ss!",
+    "full_name": "Dr. Rohan Mehta",
+    "role": "doctor",
+    "specialization": "Cardiology",
+    "license_no": "MCI-2024-00123"
+  }'
+```
+</CodeGroup>
+
+```json Response
+{
+  "id": "018f4e2a-7c3d-7000-a1b2-000000000001",
+  "email": "alice@example.com",
+  "role": "patient"
+}
+```
+
+---
+
+#### POST /v1/auth/login
+
+Authenticates a user and returns a JWT access/refresh token pair. Returns `200 OK` on success. No authentication is required to call this endpoint.
+
+When MFA is enrolled on the account, `totp_code` becomes mandatory. Omitting it — or supplying an invalid code — returns `401 Unauthorized` with `code: "mfa_required"`. Disabled accounts are rejected regardless of credentials.
+
+**Request body**
+
+<ParamField body="email" type="string" required>
+  The account's registered e-mail address, 5–255 characters.
+</ParamField>
+
+<ParamField body="password" type="string" required>
+  The account password, 1–128 characters.
+</ParamField>
+
+<ParamField body="totp_code" type="string">
+  Six- to eight-character TOTP code from the authenticator app. Required only when MFA has been enrolled on the account.
+</ParamField>
+
+**Response — `200 OK`**
+
+<ResponseField name="access_token" type="string">
+  Short-lived JWT. Include as `Authorization: Bearer <access_token>` on all protected requests.
+</ResponseField>
+
+<ResponseField name="refresh_token" type="string">
+  Long-lived single-use JWT. Store securely and use only with `/v1/auth/refresh`.
+</ResponseField>
+
+<ResponseField name="token_type" type="string">
+  Always `"bearer"`.
+</ResponseField>
+
+<CodeGroup>
+```bash Login without MFA
+curl -s -X POST https://api.amrutam.example/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "alice@example.com",
+    "password": "S3cur3P@ss!"
+  }'
+```
+
+```bash Login with MFA
+curl -s -X POST https://api.amrutam.example/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "alice@example.com",
+    "password": "S3cur3P@ss!",
+    "totp_code": "482910"
+  }'
+```
+</CodeGroup>
+
+```json Response
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "token_type": "bearer"
+}
+```
+
+---
+
+#### POST /v1/auth/refresh
+
+Rotates the token pair. The submitted refresh token is immediately consumed (deleted from Redis), and a new access + refresh token pair is issued. Returns `200 OK`. No authentication header is required.
+
+<Warning>
+  Refresh tokens are **single-use**. Presenting the same token twice — whether due to a retry or a leaked token — returns `401 Unauthorized` with `code: "refresh_reused"`. Always replace both tokens atomically in your client's secure storage.
+</Warning>
+
+**Request body**
+
+<ParamField body="refresh_token" type="string" required>
+  A valid, unused refresh token (minimum 10 characters) previously issued by `/login` or `/refresh`.
+</ParamField>
+
+**Response — `200 OK`**
+
+<ResponseField name="access_token" type="string">
+  Fresh short-lived JWT.
+</ResponseField>
+
+<ResponseField name="refresh_token" type="string">
+  New single-use refresh token. The old one is now invalid.
+</ResponseField>
+
+<ResponseField name="token_type" type="string">
+  Always `"bearer"`.
+</ResponseField>
+
+```bash curl
+curl -s -X POST https://api.amrutam.example/v1/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d '{
+    "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+  }'
+```
+
+```json Response
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "refresh_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "token_type": "bearer"
+}
+```
+
+---
+
+#### POST /v1/auth/mfa/enroll
+
+Generates a TOTP secret and `otpauth://` URL for the authenticated user and persists the secret to their account. Returns `200 OK`. Requires a valid Bearer token.
+
+Scan the `otpauth_url` with any RFC 6238-compatible authenticator app (Google Authenticator, Authy, 1Password, etc.). After scanning, immediately call `/v1/auth/mfa/verify` with a live code to confirm the device is configured correctly. MFA is **not** enforced on login until a successful verify call has been made.
+
+**Request body**
+
+No request body. The caller identity is derived from the Bearer token.
+
+**Response — `200 OK`**
+
+<ResponseField name="secret" type="string">
+  Base32-encoded TOTP secret. Store this in a secure backup location in case the authenticator device is lost.
+</ResponseField>
+
+<ResponseField name="otpauth_url" type="string">
+  `otpauth://totp/…` URI. Encode as a QR code for easy authenticator app import.
+</ResponseField>
+
+```bash curl
+curl -s -X POST https://api.amrutam.example/v1/auth/mfa/enroll \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+```
+
+```json Response
+{
+  "secret": "JBSWY3DPEHPK3PXP",
+  "otpauth_url": "otpauth://totp/Amrutam:alice%40example.com?secret=JBSWY3DPEHPK3PXP&issuer=Amrutam"
+}
+```
+
+---
+
+#### POST /v1/auth/mfa/verify
+
+Validates a live TOTP code against the enrolled secret for the authenticated user. Returns `200 OK` with `{"verified": true}` on success, or `400 Bad Request` on an invalid code. Requires a valid Bearer token.
+
+<Tip>
+  Call this endpoint immediately after `/mfa/enroll` to verify your authenticator app is synced before relying on MFA for login. TOTP codes are time-windowed — ensure the server and client clocks are within 30 seconds of each other.
+</Tip>
+
+**Request body**
+
+<ParamField body="code" type="string" required>
+  Current TOTP code from the authenticator app, 6–8 characters.
+</ParamField>
+
+**Response — `200 OK`**
+
+<ResponseField name="verified" type="boolean">
+  `true` when the TOTP code is valid. An invalid code returns `400 Bad Request` instead.
+</ResponseField>
+
+```bash curl
+curl -s -X POST https://api.amrutam.example/v1/auth/mfa/verify \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." \
+  -H "Content-Type: application/json" \
+  -d '{"code": "482910"}'
+```
+
+```json Response
+{
+  "verified": true
+}
+```
+
+---
+
+#### GET /v1/auth/me
+
+Returns the identity record for the currently authenticated user. Useful for bootstrapping client sessions after a page load. Returns `200 OK`. Requires a valid Bearer token.
+
+**Response — `200 OK`**
+
+<ResponseField name="id" type="string">
+  UUID of the authenticated user.
+</ResponseField>
+
+<ResponseField name="email" type="string">
+  The user's registered e-mail address.
+</ResponseField>
+
+<ResponseField name="role" type="string">
+  The user's assigned role: `"patient"`, `"doctor"`, or `"admin"`.
+</ResponseField>
+
+```bash curl
+curl -s https://api.amrutam.example/v1/auth/me \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+```
+
+```json Response
+{
+  "id": "018f4e2a-7c3d-7000-a1b2-000000000001",
+  "email": "alice@example.com",
+  "role": "patient"
+}
+```
+
+---
+
+#### GET /v1/auth/admin/ping
+
+RBAC health probe that confirms the caller holds the `admin` role. Returns `200 OK` with `{"status": "admin-ok"}`. Calling this with a non-admin token returns `403 Forbidden`. Useful for integration tests and role-verification tooling.
+
+**Response — `200 OK`**
+
+<ResponseField name="status" type="string">
+  Always `"admin-ok"` when the caller is an admin.
+</ResponseField>
+
+```bash curl
+curl -s https://api.amrutam.example/v1/auth/admin/ping \
+  -H "Authorization: Bearer <admin_access_token>"
+```
+
+```json Response
+{
+  "status": "admin-ok"
+}
+```

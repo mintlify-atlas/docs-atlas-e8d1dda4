@@ -1,0 +1,114 @@
+---
+title: "Amrutam Telemedicine API: Production FastAPI Backend"
+sidebarTitle: "Introduction"
+description: "A deep-dive into the Amrutam telemedicine backend — its capabilities, user roles, technology stack, and the scale targets it is built to meet."
+---
+
+Amrutam is a production-grade telemedicine backend built to handle the complete lifecycle of a remote healthcare consultation — from patient registration through doctor booking, encrypted prescription delivery, and asynchronous payment settlement. The system was designed with four non-negotiable properties: **scalability** (100k consultations per day), **reliability** (99.95% uptime target), **security** (PHI-grade encryption and chain-hash audit trails), and **observability** (full OpenTelemetry instrumentation). Every design decision — distributed locking, transactional outboxes, partition strategies, saga compensations — flows directly from those properties.
+
+## Key Capabilities
+
+<CardGroup cols={2}>
+  <Card title="JWT + MFA Authentication" icon="lock">
+    RS256 access tokens (15-minute TTL) with rotating refresh tokens and reuse detection. TOTP-based MFA enrollment and verification baked into the auth module. Argon2id password hashing throughout.
+  </Card>
+  <Card title="Idempotent Booking Engine" icon="calendar-check">
+    Every `POST /v1/bookings` requires an `Idempotency-Key`. A single Postgres transaction combines an advisory lock, `SELECT … FOR UPDATE SKIP LOCKED`, and an optimistic version guard — ten concurrent races produce exactly one winner with a `202` response.
+  </Card>
+  <Card title="Consultation Lifecycle" icon="stethoscope">
+    State-machine transitions (`held → confirmed → in_progress → completed | cancelled`) enforced server-side via `POST /v1/consultations/{id}/transition`. Ownership checks and RBAC guard every transition.
+  </Card>
+  <Card title="Encrypted Prescriptions" icon="file-medical">
+    AES-256-GCM envelope encryption — a unique DEK per row, wrapped by a KEK (KMS in production). PDFs are stored in MinIO and served via 5-minute presigned URLs.
+  </Card>
+  <Card title="Payment Saga" icon="credit-card">
+    Transactional outbox + compensations: `paid` settles `confirmed/booked`; `failed` compensates to `cancelled/open` and records a refund row. Consumers are idempotent — at-least-once delivery, effectively-once processing.
+  </Card>
+  <Card title="Chain-Hash Audit Trail" icon="link">
+    Every mutation appends a `sha256`-chained row under an advisory lock. The chain cannot be silently tampered with. Hot data lives two years in Postgres; cold data is archived seven years as Parquet.
+  </Card>
+  <Card title="OTel Observability" icon="chart-line">
+    Metrics, structured logs, and distributed traces flow from the FastAPI process through the OTel collector to Prometheus, Loki, and Tempo — all visualised in pre-built Grafana dashboards.
+  </Card>
+  <Card title="Admin Analytics" icon="chart-bar">
+    `GET /v1/analytics/daily` and `/funnel` query a materialized-view layer on the read replica, keeping analytical workloads off the write path entirely.
+  </Card>
+</CardGroup>
+
+## User Roles
+
+The platform uses role-based access control (RBAC) with three first-class roles. Every JWT embeds the role claim and every route dependency validates it before any business logic executes.
+
+| Role | Capabilities |
+|---|---|
+| **patient** | Register, log in, search doctors, create bookings, view own consultations and prescriptions, initiate payments |
+| **doctor** | Manage availability slots, view assigned consultations, issue prescriptions, transition consultation state |
+| **admin** | Access analytics, ping the admin health endpoint, perform privileged overrides on any resource |
+
+## Technology Stack
+
+Amrutam is a Python 3.11 application built on **FastAPI** with fully async I/O throughout — every database call, cache operation, and external request is non-blocking. The infrastructure runs entirely in Docker Compose for local development and is designed to lift directly into a container orchestrator for production.
+
+| Layer | Technology | Version |
+|---|---|---|
+| API framework | FastAPI + Uvicorn | 0.115 / 0.30 |
+| Language | Python | 3.11 |
+| Primary database | PostgreSQL | 16 |
+| Read replica | PostgreSQL | 16 |
+| Cache / streams | Redis | 7 |
+| Object storage | MinIO (S3-compatible) | latest |
+| Edge / TLS | Nginx | 1.27-alpine |
+| Metrics | Prometheus + Grafana | 2.52 / 10.4 |
+| Logs | Loki | 2.9 |
+| Traces | Tempo + OTel SDK | 2.4 |
+| Validation | Pydantic v2 | ≥ 2.7 |
+| ORM | SQLAlchemy asyncio | ≥ 2.0 |
+| Migrations | Alembic | ≥ 1.13 |
+
+<Info>
+  The ORM is used in async mode via `asyncpg`. SQLAlchemy never owns connection pooling in production — that role belongs to PgBouncer (a listed production TODO in the security checklist).
+</Info>
+
+## Scale Targets
+
+These targets were defined upfront and verified with k6 load runs. The measured numbers are reported in `docs/load_results.md` and summarised in the [Architecture](/architecture) page.
+
+| Metric | Target | Measured (SLO run, 3 replicas) |
+|---|---|---|
+| Daily consultations | 100,000 | — |
+| Peak throughput | ~50 rps | ~220 rps under SLO run |
+| Read latency p95 | < 200 ms | **30 ms** ✓ |
+| Write latency p95 | < 500 ms | **134 ms** ✓ |
+| Uptime | 99.95% (~21 min/month) | Verified via replica + Nginx failover |
+
+<Warning>
+  The stress run (500 read VUs + 20 write VUs, ~380 rps) showed reads at p95 1.8 s — pool-bound at 20+15 connections per replica. The fix is larger pools, more replicas, or PgBouncer. The operating point of ~50 rps peak has 4× headroom.
+</Warning>
+
+## Quality Gates
+
+Every commit passes through a CI pipeline that enforces:
+
+- **Linting:** `ruff` (E, F, I, B, UP, S, ASYNC rules) at line-length 100
+- **Formatting:** `black` with `target-version = py311`
+- **Type checking:** `mypy --strict` with explicit package bases
+- **Tests:** 23 `pytest-asyncio` tests against live Postgres + Redis containers
+- **Coverage:** minimum 60% branch coverage enforced by `pytest-cov`
+- **OpenAPI export:** `docs/api/openapi.json` regenerated on every CI run
+
+## Explore Further
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Get the full stack running locally in under five minutes using Docker Compose.
+  </Card>
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    Service topology, booking sequence diagram, ER diagram, partitioning strategy, and measured SLOs.
+  </Card>
+  <Card title="API Reference" icon="code" href="/api/overview">
+    All 25 routes with request/response schemas, error codes, and authentication requirements.
+  </Card>
+  <Card title="Authentication" icon="key" href="/concepts/authentication">
+    JWT lifecycle, MFA enrollment flow, token refresh, and RBAC enforcement.
+  </Card>
+</CardGroup>

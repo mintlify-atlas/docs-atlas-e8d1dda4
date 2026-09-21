@@ -1,0 +1,222 @@
+---
+title: "Prescriptions API: Create, View, and Download PDFs"
+sidebarTitle: "Prescriptions"
+description: "Create sealed prescriptions tied to a consultation, view decrypted metadata, and generate 5-minute presigned PDF download URLs backed by MinIO object storage."
+---
+
+Prescriptions in Amrutam are cryptographically sealed at rest using AES-256-GCM envelope encryption — the plaintext payload (diagnosis, medicines list, doctor ID, and issuance timestamp) is encrypted under a per-record data encryption key (DEK) that is itself wrapped with the `PRESCRIPTION_KEK_B64` key-encryption key. A rendered PDF is simultaneously uploaded to MinIO under the path `rx/{rx_id}.pdf`. Read access is controlled by the same role rules as consultations: only the treating doctor, the patient on the consultation, or an admin may view or download a prescription.
+
+---
+
+#### POST /v1/consultations/\{cid\}/prescriptions
+
+Issues a new prescription against an active consultation. The caller must be the treating doctor (matched by `doctor_id` on the consultation) or an admin. The consultation's `status` must be `confirmed`, `in_progress`, or `completed` — attempting to prescribe against a `held` or `cancelled` consultation returns `400 Bad Request`. On success the encrypted payload is persisted to the `prescriptions` table, a PDF is rendered and stored in MinIO, an audit event `prescription.issued` is written, and a `prescription.issued` outbox event is published. Returns `201 Created`.
+
+<Info>
+  The `medicines` field is a flat array of free-text strings (e.g. `["Amoxicillin 500mg – 3x daily – 7 days", "Paracetamol 500mg – as needed"]`). The schema enforces 1–50 items; each item is an arbitrary string up to the array-level max length.
+</Info>
+
+**Path Parameters**
+
+<ParamField path="cid" type="string" required>
+  UUID of the consultation to attach the prescription to.
+</ParamField>
+
+**Request Body**
+
+<ParamField body="diagnosis" type="string" required>
+  Clinical diagnosis text. 1–2 000 characters. Stored encrypted at rest.
+</ParamField>
+
+<ParamField body="medicines" type="array of strings" required>
+  List of medicine instructions. Must contain 1–50 items. Each item is a free-text string describing the medicine, dosage, and duration.
+</ParamField>
+
+**Response — `201 Created`** — `PrescriptionOut`
+
+<ResponseField name="id" type="string" required>
+  UUID of the newly created prescription record.
+</ResponseField>
+
+<ResponseField name="consultation_id" type="string" required>
+  UUID of the consultation this prescription is attached to.
+</ResponseField>
+
+<CodeGroup>
+
+```bash cURL
+curl -X POST \
+  https://api.amrutam.example/v1/consultations/018f4e2a-1c3b-7d9e-a012-4b6c8d0e2f5a/prescriptions \
+  -H "Authorization: Bearer $DOCTOR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "diagnosis": "Acute bacterial tonsillitis",
+    "medicines": [
+      "Amoxicillin 500mg – 3 times daily – 7 days",
+      "Paracetamol 500mg – as needed for fever"
+    ]
+  }'
+```
+
+```python Python (httpx)
+import httpx
+
+resp = httpx.post(
+    "https://api.amrutam.example/v1/consultations/018f4e2a-1c3b-7d9e-a012-4b6c8d0e2f5a/prescriptions",
+    headers={"Authorization": f"Bearer {doctor_token}"},
+    json={
+        "diagnosis": "Acute bacterial tonsillitis",
+        "medicines": [
+            "Amoxicillin 500mg – 3 times daily – 7 days",
+            "Paracetamol 500mg – as needed for fever",
+        ],
+    },
+)
+print(resp.json())
+```
+
+</CodeGroup>
+
+```json Example Response
+{
+  "id": "019a7b3c-2d4e-7f8a-b012-5c6d9e1f3a7b",
+  "consultation_id": "018f4e2a-1c3b-7d9e-a012-4b6c8d0e2f5a"
+}
+```
+
+---
+
+#### GET /v1/prescriptions/\{rx\_id\}
+
+Returns the decrypted metadata of an existing prescription. The server fetches the encrypted envelope from the database, opens it using the configured `PRESCRIPTION_KEK_B64`, and returns the plaintext `diagnosis` and `medicines` fields. Access is restricted to the treating doctor, the patient on the associated consultation, and admins — any other caller receives `403 Forbidden`.
+
+**Path Parameters**
+
+<ParamField path="rx_id" type="string" required>
+  UUID of the prescription to view.
+</ParamField>
+
+**Response — `200 OK`** — `PrescriptionView`
+
+<ResponseField name="id" type="string" required>
+  UUID of the prescription.
+</ResponseField>
+
+<ResponseField name="consultation_id" type="string" required>
+  UUID of the consultation this prescription belongs to.
+</ResponseField>
+
+<ResponseField name="diagnosis" type="string" required>
+  Decrypted diagnosis text, visible only to authorized callers.
+</ResponseField>
+
+<ResponseField name="medicines" type="array of strings" required>
+  Decrypted list of medicine instructions, visible only to authorized callers.
+</ResponseField>
+
+<CodeGroup>
+
+```bash cURL
+curl https://api.amrutam.example/v1/prescriptions/019a7b3c-2d4e-7f8a-b012-5c6d9e1f3a7b \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+```python Python (httpx)
+import httpx
+
+resp = httpx.get(
+    "https://api.amrutam.example/v1/prescriptions/019a7b3c-2d4e-7f8a-b012-5c6d9e1f3a7b",
+    headers={"Authorization": f"Bearer {access_token}"},
+)
+print(resp.json())
+```
+
+</CodeGroup>
+
+```json Example Response
+{
+  "id": "019a7b3c-2d4e-7f8a-b012-5c6d9e1f3a7b",
+  "consultation_id": "018f4e2a-1c3b-7d9e-a012-4b6c8d0e2f5a",
+  "diagnosis": "Acute bacterial tonsillitis",
+  "medicines": [
+    "Amoxicillin 500mg – 3 times daily – 7 days",
+    "Paracetamol 500mg – as needed for fever"
+  ]
+}
+```
+
+---
+
+#### GET /v1/prescriptions/\{rx\_id\}/pdf
+
+Generates and returns a presigned MinIO URL pointing to the rendered PDF for the prescription stored at `rx/{rx_id}.pdf`. The URL is valid for **300 seconds (5 minutes)** from the moment it is generated. The same access control rules apply as for `GET /v1/prescriptions/{rx_id}` — treating doctor, patient, or admin only.
+
+<Note>
+  The presigned URL expires **5 minutes** after it is issued. Generate the URL immediately before presenting it to the end user or initiating the download — do not cache or store it for later use. If the URL has expired, simply call this endpoint again to obtain a fresh one.
+</Note>
+
+**Path Parameters**
+
+<ParamField path="rx_id" type="string" required>
+  UUID of the prescription whose PDF URL you want to generate.
+</ParamField>
+
+**Response — `200 OK`** — `PdfUrl`
+
+<ResponseField name="url" type="string" required>
+  Presigned MinIO URL for the PDF. Valid for 5 minutes from the time of generation.
+</ResponseField>
+
+<ResponseField name="expires_in_s" type="integer" default="300">
+  Number of seconds until the presigned URL expires. Always `300` unless overridden by configuration.
+</ResponseField>
+
+<CodeGroup>
+
+```bash cURL
+curl https://api.amrutam.example/v1/prescriptions/019a7b3c-2d4e-7f8a-b012-5c6d9e1f3a7b/pdf \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+```python Python (httpx)
+import httpx
+
+resp = httpx.get(
+    "https://api.amrutam.example/v1/prescriptions/019a7b3c-2d4e-7f8a-b012-5c6d9e1f3a7b/pdf",
+    headers={"Authorization": f"Bearer {access_token}"},
+)
+data = resp.json()
+# Use data["url"] immediately — it expires in data["expires_in_s"] seconds
+print(data["url"])
+```
+
+</CodeGroup>
+
+```json Example Response
+{
+  "url": "https://minio.amrutam.example/prescriptions/rx/019a7b3c-2d4e-7f8a-b012-5c6d9e1f3a7b.pdf?X-Amz-Signature=...",
+  "expires_in_s": 300
+}
+```
+
+---
+
+## Error Reference
+
+<AccordionGroup>
+  <Accordion title="400 Bad Request — cannot prescribe in status {status}">
+    The consultation's current status does not permit prescription creation. The consultation must be in `confirmed`, `in_progress`, or `completed` state. Check the consultation status with `GET /v1/consultations/{cid}` first.
+  </Accordion>
+  <Accordion title="400 Bad Request — legacy prescription without envelope">
+    The prescription record exists but was created before the AES-256-GCM envelope format was introduced (no `wrapped_dek` or `nonce`). The prescription must be reissued by the treating doctor using `POST /v1/consultations/{cid}/prescriptions`.
+  </Accordion>
+  <Accordion title="403 Forbidden — only the treating doctor may prescribe">
+    The authenticated user has the `patient` role. Only users with the `doctor` or `admin` role may create prescriptions.
+  </Accordion>
+  <Accordion title="403 Forbidden — not your prescription">
+    The authenticated user is not the treating doctor, the patient on the associated consultation, or an admin. Access is strictly limited to the parties directly involved in the consultation.
+  </Accordion>
+  <Accordion title="404 Not Found — prescription not found">
+    The supplied `rx_id` does not correspond to any active (non-deleted) prescription record.
+  </Accordion>
+</AccordionGroup>

@@ -1,0 +1,168 @@
+---
+title: "Operations Runbook: Failure Recovery and DR Procedures"
+sidebarTitle: "Runbook"
+description: "Scripted recovery procedures for API replica loss, Redis outages, PostgreSQL primary failures, replica lag, backup DR promotion, and horizontal scaling."
+---
+
+Every failure scenario in the Amrutam platform has been drilled against the running compose stack and scripted under `tests/demo/`. The system is designed for graceful degradation: the most common failures — losing a replica, a Redis restart, even a primary database outage — resolve without data loss and with well-defined client behavior. This runbook documents the expected behavior and recovery steps for each scenario.
+
+## Failure Scenarios
+
+| Failure | Expected behavior | Recovery |
+|---|---|---|
+| 1 API replica down | Nginx detects failure after 3 failed upstreams (`max_fails=3`); evicts the replica from rotation; remaining replicas absorb traffic without interruption | `docker compose up -d api` brings the replica back up; Nginx re-resolves via Docker DNS (`resolver 127.0.0.11 valid=10s`) and adds it to rotation automatically |
+| Redis outage | Booking and payment endpoints remain available via PostgreSQL fallback; the rate-limit layer fails open (Nginx edge limits remain active); identical request replays are still safe due to PG-level idempotency keys | Restart Redis with `docker compose restart redis`; the outbox relay drains any backlog of undelivered events automatically on reconnect |
+| PG primary down | Read-replica routes continue returning `200`; write routes return `500` (honest failure, not silent data loss); `pool_pre_ping=True` detects the dead connection on every checkout | Restart primary with `docker compose restart postgres-primary`; SQLAlchemy's `pool_pre_ping` detects recovery and resumes writes automatically |
+| Replica lag > 10s | Prometheus alert fires (`replica_lag_seconds > 10`); read queries may return stale data | Re-seed the replica or re-point the application to the primary by updating `REPLICA_DATABASE_URL` and restarting |
+
+<Note>
+Nginx uses Docker's embedded DNS resolver (`resolver 127.0.0.11 valid=10s`) with a 10-second TTL. This means a restarted API replica rejoins the upstream pool within 10 seconds without requiring an `nginx -s reload`. The `zone api_backend 64k` shared memory directive enables runtime re-resolution.
+</Note>
+
+## Background Workers
+
+Two optional worker services handle asynchronous processing. They are started separately with the `worker` Compose profile:
+
+```bash
+docker compose --profile worker up -d
+```
+
+<CardGroup cols={2}>
+  <Card title="Outbox Relay Worker (arq)" icon="paper-plane">
+    Polls the `outbox_events` table using `SKIP LOCKED` to avoid row contention. Publishes events to Redis Streams. Marks processed rows with `processed=true`. If Redis is unavailable during the relay cycle, the outbox rows remain unprocessed and will be retried on the next poll.
+  </Card>
+  <Card title="Scheduler" icon="calendar">
+    Runs on a cron schedule to refresh PostgreSQL materialized views that back the analytics endpoints. Stale views return older data but never error — analytics reads degrade gracefully if the scheduler is stopped.
+  </Card>
+</CardGroup>
+
+<Accordion title="Checking worker health">
+  ```bash
+  # View outbox relay logs
+  docker compose logs worker --tail=50
+
+  # Check for unprocessed outbox rows (sign of relay being down)
+  docker compose exec postgres-primary \
+    psql -U amrutam -c "SELECT COUNT(*) FROM outbox_events WHERE processed = false;"
+
+  # Check scheduler last-run timestamp
+  docker compose logs scheduler --tail=20
+  ```
+</Accordion>
+
+## Backup and Disaster Recovery
+
+The platform uses continuous WAL archiving to MinIO for near-real-time backup:
+
+<Steps>
+  <Step title="WAL shipping to MinIO">
+    PostgreSQL streams Write-Ahead Log segments to the MinIO bucket continuously. This gives an **RPO (Recovery Point Objective) of under 5 minutes** — in a worst-case failure you lose at most 5 minutes of writes.
+  </Step>
+  <Step title="Promote the read replica">
+    If the primary is unrecoverable, promote the read replica to primary. Update `DATABASE_URL` in your environment to point to the (now promoted) replica's host. Restart the API:
+    ```bash
+    # Update .env
+    DATABASE_URL=postgresql+asyncpg://amrutam:amrutam@localhost:5432/amrutam
+
+    docker compose up -d api
+    ```
+    SQLAlchemy's `pool_pre_ping` ensures the new connection is verified before first use.
+  </Step>
+  <Step title="Run migrations on the new primary">
+    After promotion, run Alembic to ensure the schema is current:
+    ```bash
+    docker compose exec api alembic upgrade head
+    ```
+  </Step>
+  <Step title="Restore from WAL if replica is also lost">
+    Spin up a fresh PostgreSQL 16 instance and replay the WAL archive from MinIO. **RTO (Recovery Time Objective) is under 30 minutes** for this path.
+  </Step>
+</Steps>
+
+### Audit Log Cold Archive
+
+Audit logs are retained in PostgreSQL as the hot store for two years. For long-term compliance with India's DPDP Act and IT Act requirements, audit data is exported to Parquet format for a **7-year cold archive** stored in MinIO. This archive is write-once and is never modified after export.
+
+## Scaling the API Tier
+
+To add replicas horizontally, use Compose's `--scale` flag. One important constraint: the first replica mints the shared RS256 JWT keypair and writes it to the `jwt-secrets` Docker volume. Scaling before this volume exists causes cross-replica 401 failures (each replica would generate its own ephemeral keypair).
+
+```bash
+# Start exactly one replica first — this mints the keypair
+docker compose up -d api
+
+# Then scale to N replicas
+docker compose up -d --scale api=3 --no-deps api
+```
+
+<Warning>
+Always start with a single `api` replica before scaling. The JWT keypair is generated on first startup and written to the `jwt-secrets` volume. If you scale immediately from zero, each replica generates an independent ephemeral key — tokens signed by one replica will fail verification on another, causing cascading 401 errors under load.
+</Warning>
+
+Nginx's `least_conn` upstream policy distributes traffic to the replica with the fewest active connections. New replicas are automatically included in the rotation via Docker DNS re-resolution without any Nginx reload.
+
+## Database Migrations
+
+Run Alembic migrations against the **primary** only. Replicas receive changes via WAL streaming replication automatically:
+
+```bash
+# Apply all pending migrations to the primary
+docker compose exec api alembic upgrade head
+
+# After a replica promotion (failover), re-run on the new primary
+DATABASE_URL=postgresql+asyncpg://amrutam:amrutam@<new-primary>:5432/amrutam \
+  alembic upgrade head
+```
+
+<Accordion title="Rolling back a migration">
+  ```bash
+  # Roll back to a specific revision
+  docker compose exec api alembic downgrade <revision_id>
+
+  # Roll back exactly one step
+  docker compose exec api alembic downgrade -1
+
+  # View migration history
+  docker compose exec api alembic history --verbose
+  ```
+</Accordion>
+
+## CI Pipeline Reference
+
+The GitHub Actions CI pipeline runs on every push and pull request. All three jobs must pass before merging:
+
+<Steps>
+  <Step title="Lint">
+    `ruff check src tests` → `black --check src tests` → `mypy src`. Any type error or style violation fails the build.
+  </Step>
+  <Step title="Test">
+    Spins up `postgres:16-alpine` and `redis:7-alpine` as service containers. Runs `alembic upgrade head` then `pytest --cov=src/amrutam --cov-report=term-missing`. Coverage gate is ≥ 60%.
+  </Step>
+  <Step title="OpenAPI Export">
+    Imports the FastAPI app and writes the current OpenAPI schema to `docs/api/openapi.json`. This ensures the committed schema is always in sync with the running code.
+  </Step>
+</Steps>
+
+## Observability Quick Reference
+
+When diagnosing a live issue, use these entry points:
+
+| Signal | URL | What to look for |
+|---|---|---|
+| API health | `https://localhost:8443/health` | `{"status": "ok"}` |
+| Readiness | `https://localhost:8443/ready` | PG + Redis connectivity confirmed |
+| Metrics | `https://localhost:8443/metrics` | RED metrics: request rate, error rate, duration histograms |
+| Grafana dashboards | `http://localhost:3000` | API RED, per-replica RED, Postgres, Redis, Business, SLO burn |
+| Loki logs | Grafana → Explore | Filter by `trace_id` to correlate across services |
+
+Key alerts to investigate immediately:
+
+- `p95 latency > 200ms` on reads — check PG query plans and replica lag
+- `5xx rate > 1%` — check application logs for unhandled exceptions
+- `payment failure rate > 5%` — check payment saga compensation logs
+- `outbox lag > 60s` — check worker service is running and Redis is reachable
+- `replica lag > 10s` — consider re-pointing reads to primary temporarily
+
+<Note>
+The audit chain advisory lock (`pg_advisory_xact_lock(hashtext('audit_chain'))`) serializes all audit writers within the same PostgreSQL session. This is intentional — it is what prevents chain forks and ensures the hash chain is correct. Under very high write throughput this lock becomes a bottleneck. If you observe audit writes queuing at scale, the recommended mitigation is an async audit writer (a separate worker that batches audit rows) rather than removing the lock.
+</Note>

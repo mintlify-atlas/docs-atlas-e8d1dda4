@@ -1,0 +1,297 @@
+---
+title: "Observability: Metrics, Logs, and Traces"
+sidebarTitle: "Observability"
+description: "OTel SDK auto-instrumentation, Prometheus RED metrics, Loki structured logging, Tempo distributed tracing, Grafana dashboards, and production alert thresholds for Amrutam."
+---
+
+Amrutam ships a complete observability stack out of the box. Every Docker Compose deployment includes Prometheus for metrics, Loki for logs, Tempo for traces, and Grafana for dashboards — all wired together through a central OpenTelemetry collector. The API emits business counters alongside the standard RED (Rate / Errors / Duration) histogram, so a single Grafana session can answer both "is the system healthy?" and "how many prescriptions were sealed today?".
+
+<Note>
+  Set `OTEL_ENABLED=false` in your `.env` when running the API locally without
+  the Docker Compose observability stack. The SDK silently swallows collector
+  connection errors, but every request will emit a `tracing_disabled` log warning
+  that obscures the output of `pytest` and local `uvicorn` runs. The `api` service
+  in `docker-compose.yml` sets `OTEL_ENABLED=true` so tracing is always active in
+  Compose deployments.
+</Note>
+
+---
+
+## OpenTelemetry instrumentation
+
+The `setup_tracing` function in `src/amrutam/core/observability.py` activates
+auto-instrumentation for every I/O layer the API touches. When `OTEL_ENABLED=true`
+it installs four instrumentors:
+
+```python
+FastAPIInstrumentor.instrument_app(app)   # HTTP spans for every route
+AsyncPGInstrumentor().instrument()        # Span per SQL statement
+RedisInstrumentor().instrument()          # Span per Redis command
+# httpx instrumented implicitly by FastAPI instrumentor
+```
+
+Spans are exported via `BatchSpanProcessor` over gRPC to the OTel collector at
+`OTEL_EXPORTER_OTLP_ENDPOINT`. The service resource name is `amrutam-api`.
+
+Any exception during SDK initialisation is caught and logged as `tracing_disabled`
+so the API process never fails to start due to an unavailable collector:
+
+```python
+except Exception as e:
+    log.info("tracing_disabled", reason=str(e))
+```
+
+---
+
+## Metrics
+
+### Prometheus endpoint
+
+The API exposes a `/metrics` endpoint in Prometheus exposition format, provided by
+`prometheus-fastapi-instrumentator` and registered in `setup_metrics`:
+
+```python
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
+```
+
+Every route automatically receives a RED histogram (`http_request_duration_seconds`
+labelled by method, route pattern, and status code). Scraping is configured in
+`infra/prometheus/prometheus.yml` to collect from all three named replica
+containers as well as the DNS round-robin address:
+
+```yaml
+scrape_configs:
+  - job_name: amrutam-api            # DNS round-robin — fleet average
+    static_configs:
+      - targets: ["api:8000"]
+  - job_name: amrutam-api-replicas   # per-replica breakdown
+    static_configs:
+      - targets:
+          - "amrutam_backend-api-1:8000"
+          - "amrutam_backend-api-2:8000"
+          - "amrutam_backend-api-3:8000"
+        labels: { tier: "replica" }
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+  - job_name: redis
+    static_configs:
+      - targets: ["redis-exporter:9121"]
+```
+
+### Business counters
+
+Four domain-specific `Counter` metrics are defined in `observability.py` and
+incremented directly in service layer code:
+
+| Metric | Labels | Incremented when |
+|---|---|---|
+| `bookings_total` | `status` (`created`, `conflict`, `replay`) | A booking request resolves |
+| `payments_total` | `status` (`paid`, `failed`, `refunded`) | A payment saga settles |
+| `idempotency_replays_total` | — | A cached response is served instead of re-executing |
+| `outbox_relayed_total` | `event` (event type name) | The relay worker publishes an outbox event to Redis Streams |
+
+These counters are also exported to the OTel collector via the OTLP pipeline,
+which fans them out to Prometheus through the collector's Prometheus exporter
+endpoint at `:8889`:
+
+```yaml
+exporters:
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+```
+
+---
+
+## Structured logging with Loki
+
+The API uses `structlog` to emit JSON-formatted log records on stdout. Each record
+includes the standard structlog fields plus Amrutam-specific context keys such as
+`trace_id`, `user_id`, `event`, and `duration_ms`.
+
+Docker captures stdout from every container and the Loki container collects it.
+Grafana's Explore view can filter by any field:
+
+<Tabs>
+  <Tab title="Filter by trace ID">
+    ```logql
+    {container="amrutam_backend-api-1"} | json | trace_id="<your-trace-id>"
+    ```
+  </Tab>
+  <Tab title="Filter by event type">
+    ```logql
+    {container=~"amrutam_backend-api-.*"} | json | event="booking_created"
+    ```
+  </Tab>
+  <Tab title="Errors only">
+    ```logql
+    {container=~"amrutam_backend-api-.*"} | json | level="error"
+    ```
+  </Tab>
+</Tabs>
+
+The `trace_id` field is injected into every log record that originates from an
+instrumented request, making it trivial to jump from a Loki log line to the
+corresponding Tempo trace with Grafana's trace-to-log correlation feature.
+
+---
+
+## Distributed tracing with Tempo
+
+Traces flow from the API through the OTel collector to Tempo:
+
+```
+API (BatchSpanProcessor)
+  └─► otel-collector :4317 (gRPC OTLP receiver)
+        └─► batch processor
+              └─► otlp/tempo exporter → tempo:4317
+```
+
+The full collector pipeline from `infra/otel/otel-collector.yaml`:
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+      http:
+
+processors:
+  batch:
+
+exporters:
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+  loki:
+    endpoint: "http://loki:3100/loki/api/v1/push"
+  otlp/tempo:
+    endpoint: "http://tempo:4317"
+    tls:
+      insecure: true
+  logging:
+    loglevel: info
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus, logging]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [loki, logging]
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/tempo, logging]
+```
+
+To explore a trace, open Grafana → **Explore** → select the **Tempo** datasource →
+paste a `trace_id` from a log record or from the `X-Request-Id` response header.
+The waterfall view shows every SQL query, Redis command, and downstream HTTP call
+within the request lifetime.
+
+---
+
+## Grafana dashboards
+
+Grafana is pre-configured with three provisioned datasources (Prometheus, Loki,
+Tempo) via `infra/grafana/provisioning/datasources/datasources.yaml`.
+
+Access Grafana at **`http://localhost:3000`** with credentials `admin` / `admin`.
+
+The **Amrutam** dashboard folder contains six dashboards:
+
+<CardGroup cols={2}>
+  <Card title="API RED" icon="chart-line">
+    Fleet-wide request rate, error rate, and p50/p95/p99 latency histograms.
+    Sourced from the `amrutam-api` Prometheus job (DNS round-robin).
+  </Card>
+  <Card title="Per-replica RED" icon="server">
+    Same RED metrics broken down per container (`amrutam_backend-api-1/2/3`).
+    Used to spot hot replicas or a single failing instance dragging the average.
+  </Card>
+  <Card title="PostgreSQL" icon="database">
+    Query throughput, active connections, replication lag, table bloat, and
+    cache hit ratio from `postgres-exporter`.
+  </Card>
+  <Card title="Redis" icon="bolt">
+    Commands/sec, keyspace hits/misses, memory usage, and AOF/RDB persistence
+    status from `redis-exporter`.
+  </Card>
+  <Card title="Business" icon="briefcase-medical">
+    `bookings_total`, `payments_total`, `idempotency_replays_total`, and
+    `outbox_relayed_total` counters as rate-per-minute time series and daily
+    totals.
+  </Card>
+  <Card title="SLO Burn Rate" icon="fire">
+    Multi-window burn rate panels for the p95 latency SLO (reads &lt;200 ms,
+    writes &lt;500 ms) and the 5xx error-rate SLO (&lt;1%). Highlights how fast
+    the error budget is being consumed.
+  </Card>
+</CardGroup>
+
+---
+
+## Alert thresholds
+
+The following thresholds are baked into the Grafana alerting rules and the k6 SLO
+scripts (`infra/k6/slo.js`, `infra/k6/slo_focused.js`). Breaching any of these
+should trigger an on-call page.
+
+| Signal | Threshold | Consequence if breached |
+|---|---|---|
+| p95 read latency | **> 200 ms** | SLO breach on `GET /v1/doctors`, `/v1/search/doctors`, analytics |
+| p95 write latency | **> 500 ms** | SLO breach on `POST /v1/bookings`, payment saga |
+| 5xx error rate | **> 1 %** | Error-budget burn; check replica crash-loops and PG primary |
+| Payment failure rate | **> 5 %** | Saga compensation loop running; check gateway connectivity |
+| Outbox lag | **> 60 s** | Relay worker down; downstream notifications delayed |
+| Replica lag | **> 10 s** | Search and analytics stale; check WAL shipping or network partition |
+
+<Tip>
+  The k6 load run measured **reads p95 = 30 ms** and **writes p95 = 134 ms** at
+  operating load (~50 peak RPS with 3 API replicas), giving a comfortable margin
+  before either SLO threshold. At stress load (500 read VUs + 20 write VUs,
+  ~380 RPS), p95 latencies exceed thresholds due to connection-pool exhaustion —
+  the fix path is larger pools, PgBouncer, and additional replicas. See
+  `docs/load_results.md` for the full numbers.
+</Tip>
+
+---
+
+## Measured SLO results
+
+The numbers below come from `docs/load_results.md` — a k6 run inside the Compose
+network against 3 API replicas and a seeded replica with 1 500 doctors:
+
+<CardGroup cols={2}>
+  <Card title="SLO run (~220 RPS)" icon="circle-check">
+    **Reads:** median 7 ms, **p95 30 ms** ✓ (SLO &lt;200 ms)
+
+    **Writes:** median 52 ms, **p95 134 ms** ✓ (SLO &lt;500 ms)
+
+    All checks passed; 202/409/429 treated as settled.
+  </Card>
+  <Card title="Stress run (~380 RPS)" icon="triangle-exclamation">
+    **Reads p95 1.8 s** ✗ — pool-bound (20+15 conns/replica)
+
+    **Writes p95 986 ms** ✗
+
+    Fix path: larger pools, more replicas, PgBouncer, async audit writer.
+  </Card>
+</CardGroup>
+
+---
+
+## Quick reference
+
+| Endpoint / URL | Purpose |
+|---|---|
+| `https://localhost:8443/metrics` | Raw Prometheus exposition (per replica via Nginx) |
+| `http://localhost:9090` | Prometheus query UI and alert status |
+| `http://localhost:3000` | Grafana — dashboards, Explore, alerts |
+| `http://localhost:3100` | Loki (internal; query via Grafana Explore) |
+| `http://localhost:3200` | Tempo (internal; query via Grafana Explore) |
+| `http://otel-collector:4317` | OTel collector gRPC receiver (in-network only) |
+| `http://otel-collector:8889/metrics` | Collector's Prometheus exporter (in-network) |

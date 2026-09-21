@@ -1,0 +1,253 @@
+---
+title: "Consultations API: Lifecycle and State Transitions"
+sidebarTitle: "Consultations"
+description: "List, retrieve, and transition consultations through held, confirmed, in-progress, and completed states with role-scoped visibility and audit-logged saga compensations."
+---
+
+Every consultation in Amrutam moves through a well-defined state machine — `held → confirmed → in_progress → completed` — with cancellation available from any non-terminal state. Access is role-scoped: a patient sees only their own consultations, a doctor sees only the consultations assigned to them, and an admin sees everything. All state transitions are recorded in the audit log; cancellation additionally triggers a saga compensation that releases the underlying availability slot back to `open`.
+
+---
+
+#### GET /v1/consultations
+
+Retrieves the paginated list of consultations visible to the caller. The result set is filtered server-side by the caller's role — patients receive only consultations where they are the patient, doctors receive only consultations where they are the assigned doctor, and admins receive all consultations in descending `created_at` order. Pagination is keyset-based: pass the `created_at` value of the last item in the previous page as `cursor` to fetch the next page.
+
+**Query Parameters**
+
+<ParamField query="limit" type="integer" default="20">
+  Maximum number of consultations to return. Must be between 1 and 100.
+</ParamField>
+
+<ParamField query="cursor" type="string">
+  Keyset pagination cursor. Pass the `created_at` timestamp of the last record from the previous response to fetch the next page. Omit for the first page.
+</ParamField>
+
+**Response — `200 OK`** — array of `ConsultationOut`
+
+<ResponseField name="id" type="string" required>
+  UUID of the consultation.
+</ResponseField>
+
+<ResponseField name="patient_id" type="string" required>
+  UUID of the patient who booked the consultation.
+</ResponseField>
+
+<ResponseField name="doctor_id" type="string" required>
+  UUID of the assigned doctor.
+</ResponseField>
+
+<ResponseField name="slot_id" type="string" required>
+  UUID of the availability slot reserved for this consultation.
+</ResponseField>
+
+<ResponseField name="status" type="string" required>
+  Current lifecycle state. One of: `held`, `confirmed`, `in_progress`, `completed`, `cancelled`.
+</ResponseField>
+
+<ResponseField name="created_at" type="string (datetime)" required>
+  ISO 8601 UTC timestamp of when the consultation record was created.
+</ResponseField>
+
+<CodeGroup>
+
+```bash cURL
+curl -G https://api.amrutam.example/v1/consultations \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  --data-urlencode "limit=10"
+```
+
+```bash cURL (paginated)
+curl -G https://api.amrutam.example/v1/consultations \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  --data-urlencode "limit=10" \
+  --data-urlencode "cursor=2024-06-01T09:00:00.000000"
+```
+
+</CodeGroup>
+
+```json Example Response
+[
+  {
+    "id": "018f4e2a-1c3b-7d9e-a012-4b6c8d0e2f5a",
+    "patient_id": "018f4e2a-0001-7000-8000-000000000001",
+    "doctor_id": "018f4e2a-0002-7000-8000-000000000002",
+    "slot_id": "018f4e2a-0003-7000-8000-000000000003",
+    "status": "confirmed",
+    "created_at": "2024-06-01T09:00:00.000000"
+  }
+]
+```
+
+---
+
+#### GET /v1/consultations/\{cid\}
+
+Fetches a single consultation by its UUID. The server enforces the same role-based ownership rules as the list endpoint — a patient receives a `403 Forbidden` if `cid` belongs to a different patient, and a doctor receives a `403` if they are not the assigned doctor on that consultation. Admins may retrieve any consultation.
+
+**Path Parameters**
+
+<ParamField path="cid" type="string" required>
+  UUID of the consultation to retrieve.
+</ParamField>
+
+**Response — `200 OK`** — `ConsultationOut`
+
+<ResponseField name="id" type="string" required>
+  UUID of the consultation.
+</ResponseField>
+
+<ResponseField name="patient_id" type="string" required>
+  UUID of the patient.
+</ResponseField>
+
+<ResponseField name="doctor_id" type="string" required>
+  UUID of the assigned doctor.
+</ResponseField>
+
+<ResponseField name="slot_id" type="string" required>
+  UUID of the reserved availability slot.
+</ResponseField>
+
+<ResponseField name="status" type="string" required>
+  Current lifecycle state: `held`, `confirmed`, `in_progress`, `completed`, or `cancelled`.
+</ResponseField>
+
+<ResponseField name="created_at" type="string (datetime)" required>
+  ISO 8601 UTC creation timestamp.
+</ResponseField>
+
+```bash cURL
+curl https://api.amrutam.example/v1/consultations/018f4e2a-1c3b-7d9e-a012-4b6c8d0e2f5a \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+```json Example Response
+{
+  "id": "018f4e2a-1c3b-7d9e-a012-4b6c8d0e2f5a",
+  "patient_id": "018f4e2a-0001-7000-8000-000000000001",
+  "doctor_id": "018f4e2a-0002-7000-8000-000000000002",
+  "slot_id": "018f4e2a-0003-7000-8000-000000000003",
+  "status": "in_progress",
+  "created_at": "2024-06-01T09:00:00.000000"
+}
+```
+
+---
+
+#### POST /v1/consultations/\{cid\}/transition
+
+Drives the consultation state machine forward (or cancels it). The `action` field determines the transition to apply; the server validates both the current state and the caller's role before committing. Invalid combinations return `400 Bad Request`; insufficient role returns `403 Forbidden`. Every successful transition is written to the audit log, and `cancel` additionally fires a saga compensation that flips the slot back to `open` and publishes a `consultation.cancelled` outbox event.
+
+**Valid transition table**
+
+| Current state | Action     | Next state    | Allowed roles         |
+|---------------|------------|---------------|-----------------------|
+| `held`        | `confirm`  | `confirmed`   | `doctor`, `admin`     |
+| `confirmed`   | `start`    | `in_progress` | `doctor`, `admin`     |
+| `in_progress` | `complete` | `completed`   | `doctor`, `admin`     |
+| `held`        | `cancel`   | `cancelled`   | `patient`, `doctor`, `admin` |
+| `confirmed`   | `cancel`   | `cancelled`   | `patient`, `doctor`, `admin` |
+| `in_progress` | `cancel`   | `cancelled`   | `patient`, `doctor`, `admin` |
+
+<Note>
+  `completed` and `cancelled` are terminal states. Attempting to transition from either returns `400 Bad Request` with the message `illegal transition {cur} + {action}`.
+</Note>
+
+**Path Parameters**
+
+<ParamField path="cid" type="string" required>
+  UUID of the consultation to transition.
+</ParamField>
+
+**Request Body**
+
+<ParamField body="action" type="string" required>
+  The action to apply. Must be one of: `confirm`, `start`, `complete`, `cancel`.
+</ParamField>
+
+**Response — `200 OK`** — updated `ConsultationOut`
+
+<ResponseField name="id" type="string" required>
+  UUID of the consultation.
+</ResponseField>
+
+<ResponseField name="patient_id" type="string" required>
+  UUID of the patient.
+</ResponseField>
+
+<ResponseField name="doctor_id" type="string" required>
+  UUID of the assigned doctor.
+</ResponseField>
+
+<ResponseField name="slot_id" type="string" required>
+  UUID of the reserved availability slot.
+</ResponseField>
+
+<ResponseField name="status" type="string" required>
+  The new lifecycle state after the transition was applied.
+</ResponseField>
+
+<ResponseField name="created_at" type="string (datetime)" required>
+  ISO 8601 UTC creation timestamp (unchanged by transitions).
+</ResponseField>
+
+<CodeGroup>
+
+```bash Confirm (doctor)
+curl -X POST \
+  https://api.amrutam.example/v1/consultations/018f4e2a-1c3b-7d9e-a012-4b6c8d0e2f5a/transition \
+  -H "Authorization: Bearer $DOCTOR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action": "confirm"}'
+```
+
+```bash Start (doctor)
+curl -X POST \
+  https://api.amrutam.example/v1/consultations/018f4e2a-1c3b-7d9e-a012-4b6c8d0e2f5a/transition \
+  -H "Authorization: Bearer $DOCTOR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action": "start"}'
+```
+
+```bash Cancel (patient)
+curl -X POST \
+  https://api.amrutam.example/v1/consultations/018f4e2a-1c3b-7d9e-a012-4b6c8d0e2f5a/transition \
+  -H "Authorization: Bearer $PATIENT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action": "cancel"}'
+```
+
+</CodeGroup>
+
+```json Example Response
+{
+  "id": "018f4e2a-1c3b-7d9e-a012-4b6c8d0e2f5a",
+  "patient_id": "018f4e2a-0001-7000-8000-000000000001",
+  "doctor_id": "018f4e2a-0002-7000-8000-000000000002",
+  "slot_id": "018f4e2a-0003-7000-8000-000000000003",
+  "status": "confirmed",
+  "created_at": "2024-06-01T09:00:00.000000"
+}
+```
+
+---
+
+## Error Reference
+
+<AccordionGroup>
+  <Accordion title="400 Bad Request — illegal transition">
+    Returned when the requested `action` is not valid for the consultation's current `status`. Check the transition table above and ensure the consultation is in the expected state before retrying.
+  </Accordion>
+  <Accordion title="403 Forbidden — not your consultation">
+    Returned when the authenticated user does not have ownership or role-based access to the consultation. Patients can only access consultations where they are `patient_id`; doctors can only access consultations where they are `doctor_id`.
+  </Accordion>
+  <Accordion title="403 Forbidden — action requires doctor or admin">
+    Returned when a `patient` attempts to drive a clinical transition (`confirm`, `start`, or `complete`). Only users with the `doctor` or `admin` role may perform these actions.
+  </Accordion>
+  <Accordion title="404 Not Found — consultation not found">
+    The supplied `cid` does not correspond to any consultation record in the database.
+  </Accordion>
+  <Accordion title="409 Conflict — transition lost update">
+    A concurrent modification was detected after the transition was applied. Retry the request — the consultation will already be in the new target state if the transition succeeded.
+  </Accordion>
+</AccordionGroup>

@@ -1,0 +1,280 @@
+---
+title: "Deploy Amrutam with Docker Compose"
+sidebarTitle: "Docker Compose"
+description: "Run the complete Amrutam telemedicine stack with Docker Compose: service topology, startup order, JWT key sharing, Nginx TLS, replica profiles, and database migrations."
+---
+
+Docker Compose is the canonical way to run the complete Amrutam stack for local development, integration testing, and single-host staging. One `docker compose up` command brings up the edge proxy, API replicas, PostgreSQL primary, Redis, MinIO, the full observability pipeline, and optional services behind named profiles — no Kubernetes or external infrastructure required.
+
+## Prerequisites
+
+- **Docker Engine 24+** with the BuildKit backend (bundled since Engine 23)
+- **Docker Compose v2** (`docker compose version` — note: no hyphen)
+- 8 GB RAM recommended when running all observability services simultaneously
+- Ports `8080`, `8443`, `5432`, `6379`, `9000`, `9001`, `3000`, `9090`, `8025` available on the host
+
+---
+
+## Service topology
+
+The table below maps every service in `docker-compose.yml` to its role, image, and host port binding.
+
+| Service | Image / source | Ports | Role |
+|---|---|---|---|
+| `nginx` | `nginx:1.27-alpine` | `8080→80`, `8443→443` | TLS termination, rate limiting, round-robin LB with health eviction |
+| `api` ×N | `Dockerfile` → `src/amrutam` | in-network `:8000` | Stateless FastAPI replicas; never exposed directly |
+| `worker` | `Dockerfile` → `amrutam.workers.relay` | — | Outbox-to-stream relay (`--profile worker`) |
+| `scheduler` | `Dockerfile` → `amrutam.workers.scheduler` | — | Materialised-view refresh cron (`--profile worker`) |
+| `postgres-primary` | `postgres:16-alpine` | `:5432` | RW source-of-truth; partitioned slots, consultations, and audit tables |
+| `postgres-replica` | `postgres:16-alpine` | `:5434` | RO search and analytics (`--profile replica`) |
+| `redis` | `redis:7-alpine` | `:6379` | Idempotency cache, rate-limit buckets, outbox streams, refresh JTIs |
+| `minio` | `quay.io/minio/minio:latest` | `:9000`, `:9001` | S3-compatible store for sealed Rx PDFs |
+| `otel-collector` | `otel/opentelemetry-collector-contrib:0.102.0` | `:4317`, `:4318` | OTLP receiver; fans out to Prometheus, Loki, and Tempo |
+| `prometheus` | `prom/prometheus:v2.52.0` | `:9090` | Time-series scraping and alerting |
+| `loki` | `grafana/loki:2.9.6` | `:3100` | Structured log aggregation |
+| `tempo` | `grafana/tempo:2.4.1` | `:3200` | Distributed trace storage |
+| `grafana` | `grafana/grafana:10.4.2` | `:3000` | Dashboards, Explore, and alert routing |
+| `postgres-exporter` | `quay.io/prometheuscommunity/postgres-exporter:v0.15.0` | — | PostgreSQL metrics into Prometheus |
+| `redis-exporter` | `oliver006/redis_exporter:v1.62.0` | — | Redis metrics into Prometheus |
+| `mailhog` | `mailhog/mailhog:v1.0.1` | `:8025`, `:1025` | Dev SMTP sink for notification workers |
+
+<Note>
+  Port `:8000` on the `api` containers is intentionally **not** published to the
+  host. All traffic must pass through Nginx on `:8443` (HTTPS) or `:8080` (HTTP,
+  which immediately redirects to HTTPS). This mirrors a production topology where
+  API nodes are in a private subnet.
+</Note>
+
+---
+
+## Full startup walkthrough
+
+<Steps>
+  <Step title="Copy and edit the environment file">
+    ```bash
+    cp .env.example .env
+    ```
+
+    Open `.env` and replace the placeholder values for `PRESCRIPTION_KEK_B64`,
+    `PAYMENT_WEBHOOK_SECRET`, and any credential you intend to keep private.
+    See the [Environment Variables reference](/deployment/environment) for the
+    full variable list.
+  </Step>
+
+  <Step title="Build images and start core services">
+    ```bash
+    docker compose up -d --build
+    ```
+
+    This starts: `nginx`, `api` (one replica initially), `postgres-primary`,
+    `redis`, `minio`, `otel-collector`, `prometheus`, `loki`, `tempo`,
+    `grafana`, both exporters, and `mailhog`.
+
+    On the very first start, `entrypoint.sh` runs inside the `api` container and
+    generates:
+    - A self-signed TLS certificate written to the `tls/` bind-mount (used by Nginx)
+    - An RS256 keypair written to the `jwt-secrets` named volume at `/run/secrets/`
+  </Step>
+
+  <Step title="Run database migrations on the primary">
+    ```bash
+    docker compose exec api alembic upgrade head
+    ```
+
+    Alembic applies every migration in `migrations/versions/` against
+    `postgres-primary`. The baseline migration (`0001_baseline.py`) creates all
+    core tables including hash-partitioned `availability_slots` (8 partitions),
+    range-partitioned `consultations` and `audit_logs`, `outbox_events`,
+    `idempotency_keys`, and the `prescriptions` / `payments` tables.
+  </Step>
+
+  <Step title="Start the read replica (optional)">
+    ```bash
+    docker compose --profile replica up -d postgres-replica
+    ```
+
+    The replica profile starts a second PostgreSQL instance on port `:5434`. For
+    the Compose demo environment it is seeded with the same Alembic migrations
+    rather than configured as a streaming physical replica (which requires WAL
+    shipping setup). In production this should be a proper streaming replica
+    pointed at by `REPLICA_DATABASE_URL`.
+
+    Run migrations on the replica if you want the search and analytics routes to
+    work in isolation:
+
+    ```bash
+    DATABASE_URL=postgresql+asyncpg://amrutam:amrutam@localhost:5434/amrutam \
+      .venv/bin/alembic upgrade head
+    ```
+  </Step>
+
+  <Step title="Scale the API horizontally">
+    ```bash
+    docker compose up -d --scale api=3 --no-deps api
+    ```
+
+    Compose spins up two additional `api` replicas (containers
+    `amrutam_backend-api-2` and `amrutam_backend-api-3`). Each new replica mounts
+    the `jwt-secrets` volume, so it reads the **same** RS256 keypair generated by
+    the first replica — tokens issued by replica 1 are verifiable by replicas 2
+    and 3 without any token-synchronisation overhead.
+
+    Nginx uses Docker's embedded DNS resolver (`127.0.0.11`, `valid=10s`) with
+    `least_conn` upstream balancing, so new containers join the rotation within
+    10 seconds of starting without requiring an Nginx reload.
+  </Step>
+
+  <Step title="Verify the stack is healthy">
+    ```bash
+    curl -k https://localhost:8443/health
+    # → {"status":"ok"}
+    ```
+
+    Additional entry points:
+    - API (via Nginx): `https://localhost:8443`
+    - Interactive API docs: `https://localhost:8443/docs`
+    - Grafana: `http://localhost:3000` (admin / admin)
+    - Prometheus: `http://localhost:9090`
+    - MinIO console: `http://localhost:9001` (minioadmin / minioadmin)
+    - MailHog: `http://localhost:8025`
+  </Step>
+</Steps>
+
+<Tip>
+  Always let a **single** `api` replica fully start before running
+  `--scale api=3`. The first replica generates the shared RS256 keypair into the
+  `jwt-secrets` volume. If you scale immediately (before the keypair exists), each
+  replica may generate its own independent keypair, causing cross-replica `401
+  Unauthorized` errors because tokens signed by replica 1 cannot be verified by
+  replicas 2 or 3. The entrypoint is idempotent — it skips key generation if the
+  PEM files already exist.
+</Tip>
+
+---
+
+## Worker profile
+
+The outbox relay and the materialised-view scheduler run as separate containers
+so they can be scaled and updated independently of the API:
+
+```bash
+docker compose --profile worker up -d
+```
+
+This starts two services:
+
+- **`worker`** (`python -m amrutam.workers.relay`) — polls `outbox_events WHERE
+  processed = FALSE` and publishes each event to a Redis stream, then marks the
+  row processed. Provides at-least-once delivery without a separate message broker.
+- **`scheduler`** (`python -m amrutam.workers.scheduler`) — periodically
+  refreshes materialised views used by analytics routes and cleans up expired
+  idempotency keys.
+
+Both services share the same Docker image built from the root `Dockerfile`.
+
+---
+
+## Nginx: TLS termination and load balancing
+
+The `infra/nginx/amrutam.conf` configuration handles three concerns simultaneously:
+
+**TLS termination** — Port 80 issues a `301` permanent redirect to port 443.
+Port 443 serves TLS 1.2/1.3 only (`HIGH:!aNULL:!MD5`) with HSTS, X-Frame-Options,
+and X-Content-Type-Options security headers.
+
+**Rate limiting** — Two sliding-window zones protect the API:
+- `user_ip` (10 MB zone, 20 req/s) — per source IP, burst of 50
+- `user_jwt` (10 MB zone, 10 req/s) — per `Authorization` header value, burst of 20
+
+**Load balancing with health eviction** — The `api_backend` upstream uses
+`least_conn` scheduling and Docker's internal DNS resolver so replicas added or
+removed by `--scale` join or leave the rotation within 10 s. `max_fails=3
+fail_timeout=30s` evicts unhealthy replicas automatically; `proxy_next_upstream`
+retries the next upstream on `502`/`503` responses so a single crashing replica
+is invisible to clients.
+
+```nginx
+upstream api_backend {
+    zone api_backend 64k;
+    least_conn;
+    server api:8000 resolve max_fails=3 fail_timeout=30s;
+    keepalive 32;
+}
+```
+
+---
+
+## Database migrations
+
+Alembic manages the schema. Migration files live in `migrations/versions/` and
+are versioned as `000N_<description>.py`.
+
+<Accordion title="Baseline migration tables (0001_baseline.py)">
+  The first migration creates all production tables:
+
+  - `users`, `profiles`, `doctors` (with `gin_trgm_ops` index on `specialization`)
+  - `availability_slots` — HASH partitioned by `doctor_id` into 8 partitions
+  - `consultations` — RANGE partitioned by `created_at` (monthly)
+  - `prescriptions` — encrypted BYTEA payload
+  - `payments` — saga status tracking
+  - `outbox_events` — with partial index on `processed = FALSE`
+  - `idempotency_keys` — request deduplication cache
+  - `audit_logs` — RANGE partitioned by `ts` (weekly), with chain-hash columns
+</Accordion>
+
+Run all pending migrations:
+
+```bash
+docker compose exec api alembic upgrade head
+```
+
+Show migration history:
+
+```bash
+docker compose exec api alembic history --verbose
+```
+
+Roll back one step:
+
+```bash
+docker compose exec api alembic downgrade -1
+```
+
+---
+
+## Upgrading the API
+
+To deploy a new version of the application code:
+
+```bash
+# 1. Rebuild the api image
+docker compose build api
+
+# 2. Rolling restart: Compose recreates replicas one at a time
+docker compose up -d --build api
+
+# 3. Apply any new migrations
+docker compose exec api alembic upgrade head
+```
+
+Nginx's `max_fails` health eviction means in-flight requests are drained from a
+replica before Compose stops it, making rolling restarts near-zero-downtime for
+stateless HTTP traffic.
+
+---
+
+## Volumes and data persistence
+
+| Volume | Contents | Notes |
+|---|---|---|
+| `pgdata-primary` | PostgreSQL primary WAL + data files | Back up via `pg_dump` or WAL streaming to MinIO |
+| `pgdata-replica` | PostgreSQL replica data files | Re-seed from primary if diverged |
+| `redisdata` | Redis AOF journal | Survives container restart; delete to reset all caches |
+| `miniodata` | Rx PDF objects | Treat as durable storage — back up to external S3 in prod |
+| `jwt-secrets` | RS256 private + public PEM keys | **Shared across all API replicas** — do not delete while the stack is running |
+
+To fully reset a local environment:
+
+```bash
+docker compose down -v   # removes all volumes — destructive
+```

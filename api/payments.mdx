@@ -1,0 +1,248 @@
+---
+title: "Payments API: Create Intent and Handle Webhooks"
+sidebarTitle: "Payments"
+description: "Create payment intents for held consultations, handle gateway webhooks with secret validation, and observe saga compensations that auto-cancel failed bookings and free slots."
+---
+
+The Amrutam payment flow follows a saga pattern. A patient (or admin) submits a payment intent via `POST /v1/payments`, which records the intent, calls the mock charge gateway, and immediately synchronises the outcome through the same webhook settlement path used by real gateway callbacks. On a `paid` outcome the consultation moves to `confirmed` and the slot is marked `booked`; on a `failed` outcome the consultation is cancelled and the slot is released back to `open` as a saga compensation. Both paths publish outbox events for downstream consumers. The `POST /v1/payments/webhook` endpoint is idempotent — replaying the same `gateway_ref` with the same terminal status returns the stored payment record without re-applying side effects.
+
+---
+
+#### POST /v1/payments
+
+Creates a payment intent for a consultation that is currently in the `held` state. The endpoint is rate-limited to **30 requests per minute per user**. An `Idempotency-Key` header is **required**; omitting it returns `400 Bad Request`. If a payment intent already exists for the given `consultation_id` (e.g. from a previous call with the same idempotency key), the existing payment record is returned immediately without creating a duplicate. Returns `202 Accepted`.
+
+<Warning>
+  The `force_fail` flag exists exclusively for testing the failure compensation path. It must never be set to `true` in production client code — doing so will immediately cancel the consultation and release the slot.
+</Warning>
+
+**Required Headers**
+
+| Header            | Description                                                                  |
+|-------------------|------------------------------------------------------------------------------|
+| `Authorization`   | `Bearer <access_token>` — must be a `patient` or `admin` token.             |
+| `Idempotency-Key` | Client-generated UUID. The server uses this to deduplicate concurrent retries. |
+
+**Request Body**
+
+<ParamField body="consultation_id" type="string" required>
+  UUID of the consultation to pay for. Must be in `held` status and belong to the authenticated patient (or any consultation if the caller is an `admin`).
+</ParamField>
+
+<ParamField body="amount" type="integer" required>
+  Charge amount in the smallest currency unit (e.g. paise for INR). Must be greater than 0 and at most 1 000 000.
+</ParamField>
+
+<ParamField body="currency" type="string" default="INR">
+  ISO 4217 currency code. Defaults to `INR`. Maximum 8 characters.
+</ParamField>
+
+<ParamField body="force_fail" type="boolean" default="false">
+  Testing flag. When `true`, the mock gateway returns a failure, triggering the saga compensation branch (consultation cancelled, slot freed). **Do not use in production.**
+</ParamField>
+
+**Response — `202 Accepted`** — `PaymentOut`
+
+<ResponseField name="id" type="string" required>
+  UUID of the payment record.
+</ResponseField>
+
+<ResponseField name="consultation_id" type="string" required>
+  UUID of the consultation this payment is associated with.
+</ResponseField>
+
+<ResponseField name="status" type="string" required>
+  Payment status at the time of the response. Will be `paid` or `failed` because the mock gateway settles synchronously; real gateway integrations return `pending` until the webhook fires.
+</ResponseField>
+
+<ResponseField name="gateway_ref" type="string">
+  Gateway transaction reference returned by the payment provider. May be `null` if the intent was replayed from an idempotency cache before a gateway reference was assigned.
+</ResponseField>
+
+<CodeGroup>
+
+```bash cURL
+curl -X POST https://api.amrutam.example/v1/payments \
+  -H "Authorization: Bearer $PATIENT_TOKEN" \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "consultation_id": "018f4e2a-1c3b-7d9e-a012-4b6c8d0e2f5a",
+    "amount": 50000,
+    "currency": "INR"
+  }'
+```
+
+```python Python (httpx)
+import httpx, uuid
+
+resp = httpx.post(
+    "https://api.amrutam.example/v1/payments",
+    headers={
+        "Authorization": f"Bearer {patient_token}",
+        "Idempotency-Key": str(uuid.uuid4()),
+    },
+    json={
+        "consultation_id": "018f4e2a-1c3b-7d9e-a012-4b6c8d0e2f5a",
+        "amount": 50000,
+        "currency": "INR",
+    },
+)
+print(resp.status_code, resp.json())
+```
+
+```bash Force-fail (test only)
+curl -X POST https://api.amrutam.example/v1/payments \
+  -H "Authorization: Bearer $PATIENT_TOKEN" \
+  -H "Idempotency-Key: $(uuidgen)" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "consultation_id": "018f4e2a-1c3b-7d9e-a012-4b6c8d0e2f5a",
+    "amount": 50000,
+    "currency": "INR",
+    "force_fail": true
+  }'
+```
+
+</CodeGroup>
+
+```json Example Response (paid)
+{
+  "id": "01a2b3c4-d5e6-7f8a-9012-b3c4d5e6f7a8",
+  "consultation_id": "018f4e2a-1c3b-7d9e-a012-4b6c8d0e2f5a",
+  "status": "paid",
+  "gateway_ref": "gw_mock_abc123def456"
+}
+```
+
+---
+
+#### POST /v1/payments/webhook
+
+Receives settlement notifications from the payment gateway and applies the appropriate saga branch. This endpoint does **not** require a user Bearer token — it is authenticated exclusively by the `X-Webhook-Secret` header, which must match the value of the `PAYMENT_WEBHOOK_SECRET` environment variable. A missing or incorrect secret returns `401 Unauthorized`.
+
+The endpoint is fully idempotent: if the same `gateway_ref` is delivered more than once with the same terminal `status`, the server returns the stored payment record without re-executing any database mutations or outbox inserts.
+
+<Warning>
+  **Rotate `PAYMENT_WEBHOOK_SECRET` immediately if it is ever exposed.** This secret is the sole authentication mechanism for the webhook endpoint, which has the power to confirm or cancel consultations and release availability slots. Use a cryptographically random value of at least 32 bytes, store it only in your secrets manager, and never log or transmit it in plaintext. Set it via the `PAYMENT_WEBHOOK_SECRET` environment variable.
+</Warning>
+
+**Saga outcome summary**
+
+| `status` in payload | Payment record | Consultation | Slot          | Outbox event           |
+|---------------------|----------------|--------------|---------------|------------------------|
+| `paid`              | `paid`         | `confirmed`  | `booked`      | `payment.captured`     |
+| `failed`            | `failed`       | `cancelled`  | `open`        | `payment.failed`       |
+
+**Required Headers**
+
+| Header              | Description                                                                      |
+|---------------------|----------------------------------------------------------------------------------|
+| `X-Webhook-Secret`  | Must exactly match the `PAYMENT_WEBHOOK_SECRET` environment variable value.     |
+
+**Request Body** — `WebhookPayload`
+
+<ParamField body="consultation_id" type="string" required>
+  UUID of the consultation the payment relates to. 8–64 characters.
+</ParamField>
+
+<ParamField body="status" type="string" required>
+  Settlement outcome. Must be exactly `paid` or `failed`.
+</ParamField>
+
+<ParamField body="gateway_ref" type="string" required>
+  Unique transaction reference from the payment gateway. 1–128 characters. Used for idempotent replay detection.
+</ParamField>
+
+**Response — `200 OK`** — updated `PaymentOut`
+
+<ResponseField name="id" type="string" required>
+  UUID of the payment record.
+</ResponseField>
+
+<ResponseField name="consultation_id" type="string" required>
+  UUID of the associated consultation.
+</ResponseField>
+
+<ResponseField name="status" type="string" required>
+  Terminal payment status: `paid` or `failed`.
+</ResponseField>
+
+<ResponseField name="gateway_ref" type="string">
+  Gateway transaction reference as recorded in the payment record.
+</ResponseField>
+
+<CodeGroup>
+
+```bash Paid webhook
+curl -X POST https://api.amrutam.example/v1/payments/webhook \
+  -H "X-Webhook-Secret: $PAYMENT_WEBHOOK_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "consultation_id": "018f4e2a-1c3b-7d9e-a012-4b6c8d0e2f5a",
+    "status": "paid",
+    "gateway_ref": "gw_live_xyz789abc012"
+  }'
+```
+
+```bash Failed webhook
+curl -X POST https://api.amrutam.example/v1/payments/webhook \
+  -H "X-Webhook-Secret: $PAYMENT_WEBHOOK_SECRET" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "consultation_id": "018f4e2a-1c3b-7d9e-a012-4b6c8d0e2f5a",
+    "status": "failed",
+    "gateway_ref": "gw_live_xyz789abc012"
+  }'
+```
+
+</CodeGroup>
+
+```json Example Response (paid)
+{
+  "id": "01a2b3c4-d5e6-7f8a-9012-b3c4d5e6f7a8",
+  "consultation_id": "018f4e2a-1c3b-7d9e-a012-4b6c8d0e2f5a",
+  "status": "paid",
+  "gateway_ref": "gw_live_xyz789abc012"
+}
+```
+
+```json Example Response (failed / compensation)
+{
+  "id": "01a2b3c4-d5e6-7f8a-9012-b3c4d5e6f7a8",
+  "consultation_id": "018f4e2a-1c3b-7d9e-a012-4b6c8d0e2f5a",
+  "status": "failed",
+  "gateway_ref": "gw_live_xyz789abc012"
+}
+```
+
+---
+
+## Error Reference
+
+<AccordionGroup>
+  <Accordion title="400 Bad Request — Idempotency-Key header is required">
+    The `POST /v1/payments` request was made without an `Idempotency-Key` header. Generate a UUID on the client side and include it with every payment intent creation request.
+  </Accordion>
+  <Accordion title="400 Bad Request — cannot pay in status {status}">
+    The consultation is not in the `held` state. Payment intents may only be created for consultations that are waiting for payment confirmation. Check the consultation's current status before retrying.
+  </Accordion>
+  <Accordion title="400 Bad Request — status must be paid|failed">
+    The webhook payload's `status` field contained a value other than `paid` or `failed`. The field pattern is validated by the schema as `^(paid|failed)$`.
+  </Accordion>
+  <Accordion title="401 Unauthorized — bad webhook secret">
+    The `X-Webhook-Secret` header was missing or did not match `PAYMENT_WEBHOOK_SECRET`. Verify the secret value in your gateway's webhook configuration matches the environment variable exactly.
+  </Accordion>
+  <Accordion title="403 Forbidden — only the patient may pay">
+    The authenticated user has the `doctor` role, which is not permitted to initiate payments. Only `patient` and `admin` roles may call `POST /v1/payments`.
+  </Accordion>
+  <Accordion title="404 Not Found — payment intent not found">
+    The webhook referenced a `consultation_id` for which no payment intent exists. Ensure `POST /v1/payments` was called successfully before the webhook is delivered.
+  </Accordion>
+  <Accordion title="409 Conflict — payment already settled differently">
+    The webhook attempted to settle a payment that was already in a terminal state (`paid` or `failed`) with a **different** `gateway_ref`. This indicates a gateway configuration error. Investigate the discrepancy before retrying.
+  </Accordion>
+  <Accordion title="429 Too Many Requests — rate limit exceeded">
+    The caller has exceeded the 30-requests-per-minute rate limit on `POST /v1/payments`. Back off and retry after the rate-limit window resets (60 seconds).
+  </Accordion>
+</AccordionGroup>

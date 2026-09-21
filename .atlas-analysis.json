@@ -1,0 +1,117 @@
+{
+  "projectType": "api-service",
+  "projectName": "Amrutam Telemedicine API",
+  "projectDescription": "Production-grade FastAPI backend for a telemedicine platform featuring JWT+MFA authentication, RBAC, idempotent booking, consultation lifecycle management, encrypted prescriptions, payment saga, and full OpenTelemetry observability.",
+  "theme": "luma",
+  "primaryColor": "#1E7A5A",
+  "lightColor": "#E8F5EF",
+  "darkColor": "#0F3D2D",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "architecture"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/authentication",
+              "concepts/booking-flow",
+              "concepts/consultations",
+              "concepts/prescriptions",
+              "concepts/payments"
+            ]
+          },
+          {
+            "group": "Configuration & Deployment",
+            "pages": [
+              "deployment/environment",
+              "deployment/docker",
+              "deployment/observability"
+            ]
+          },
+          {
+            "group": "Security & Operations",
+            "pages": [
+              "operations/security",
+              "operations/rate-limiting",
+              "operations/runbook"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "api/overview",
+              "api/errors"
+            ]
+          },
+          {
+            "group": "Endpoints",
+            "pages": [
+              "api/auth",
+              "api/doctors",
+              "api/bookings",
+              "api/consultations",
+              "api/prescriptions",
+              "api/payments",
+              "api/search",
+              "api/analytics",
+              "api/health"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "JWT RS256 + TOTP MFA authentication with RBAC (patient / doctor / admin)",
+    "Idempotent concurrent-safe booking with Redis replay cache and PostgreSQL advisory locks",
+    "Consultation lifecycle state machine (held → confirmed → in-progress → completed / cancelled)",
+    "AES-256-GCM envelope-encrypted prescriptions stored as PDFs in MinIO (S3)",
+    "Payment saga with transactional outbox and automatic compensations",
+    "Chain-hash append-only audit trail across all mutations",
+    "PostgreSQL primary + read-replica topology with keyset pagination",
+    "Full OpenTelemetry observability: Prometheus metrics, Loki logs, Tempo traces, Grafana dashboards",
+    "Redis token-bucket rate limiting per user plus Nginx edge rate limits",
+    "Doctor availability slot management with hash-partitioned PostgreSQL tables"
+  ],
+  "publicApiSurface": [
+    "GET /health",
+    "GET /ready",
+    "GET /metrics",
+    "POST /v1/auth/register",
+    "POST /v1/auth/login",
+    "POST /v1/auth/refresh",
+    "POST /v1/auth/mfa/enroll",
+    "POST /v1/auth/mfa/verify",
+    "GET /v1/auth/me",
+    "GET /v1/auth/admin/ping",
+    "GET /v1/doctors",
+    "POST /v1/doctors/slots",
+    "GET /v1/doctors/{doctor_id}/slots",
+    "POST /v1/bookings",
+    "GET /v1/consultations",
+    "GET /v1/consultations/{cid}",
+    "POST /v1/consultations/{cid}/transition",
+    "POST /v1/consultations/{cid}/prescriptions",
+    "GET /v1/prescriptions/{rx_id}",
+    "GET /v1/prescriptions/{rx_id}/pdf",
+    "POST /v1/payments",
+    "POST /v1/payments/webhook",
+    "GET /v1/search/doctors",
+    "GET /v1/analytics/daily",
+    "GET /v1/analytics/funnel"
+  ]
+}

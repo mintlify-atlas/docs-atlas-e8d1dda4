@@ -1,0 +1,176 @@
+---
+title: 'Bookings API: Idempotent Slot Reservation'
+sidebarTitle: 'Bookings'
+description: 'Idempotently reserve a doctor slot as a patient. Send an Idempotency-Key header to safely retry on network failure. Returns 202 with a held consultation.'
+---
+
+The Bookings API exposes a single endpoint — `POST /v1/bookings` — that atomically reserves a doctor's availability slot and creates a `consultation` record in the `held` state. The entire operation is idempotent: submitting the same `Idempotency-Key` a second time (after a network timeout, for example) returns the original `202 Accepted` response without creating a duplicate booking.
+
+The implementation uses a **two-layer replay cache** (Redis fast path + PostgreSQL durable fallback) combined with a `SELECT … FOR UPDATE SKIP LOCKED` advisory transaction to prevent double-booking under concurrent load. Slots must have status `open` to be reservable; attempting to book a `held` or `cancelled` slot returns `409 Conflict`.
+
+<Warning>
+  Only users with the `patient` role may call this endpoint. Doctor and admin tokens are rejected with `403 Forbidden`. Ensure the access token was issued for a `patient` account before calling.
+</Warning>
+
+---
+
+#### POST /v1/bookings
+
+Reserves an `open` availability slot and creates a consultation in `held` status. Returns `202 Accepted`. Requires a valid patient Bearer token and an `Idempotency-Key` header.
+
+The response `Location` header points to the created consultation resource at `/v1/consultations/{id}`.
+
+**Request headers**
+
+<ParamField header="Authorization" type="string" required>
+  `Bearer <access_token>` — must be a token issued for a `patient` account.
+</ParamField>
+
+<ParamField header="Idempotency-Key" type="string" required>
+  A client-generated UUID v4 (or any unique string) that uniquely identifies this booking attempt. Re-send the **same key** on retries to receive the original response. Using a new key on a retry will create a second booking if the first succeeded.
+</ParamField>
+
+**Request body**
+
+<ParamField body="slot_id" type="string" required>
+  UUID of the availability slot to reserve, 8–64 characters. The slot must currently have status `open`; any other status returns `409 Conflict`.
+</ParamField>
+
+**Response — `202 Accepted`**
+
+<ResponseField name="id" type="string">
+  UUID of the newly created consultation. Use this to poll `/v1/consultations/{id}` for status updates.
+</ResponseField>
+
+<ResponseField name="status" type="string">
+  Always `"held"` on the initial booking response. The consultation transitions to `confirmed` → `in_progress` → `completed` (or `cancelled`) via the Consultations API.
+</ResponseField>
+
+<ResponseField name="slot_id" type="string">
+  UUID of the reserved slot, confirming which slot was locked.
+</ResponseField>
+
+**Response headers**
+
+| Header | Description |
+|---|---|
+| `Location` | `/v1/consultations/{id}` — direct link to the consultation resource. |
+
+---
+
+<Steps>
+  <Step title="Obtain a patient access token">
+    Log in as a `patient` account via `POST /v1/auth/login` and save the `access_token`.
+  </Step>
+  <Step title="Find an open slot">
+    Call `GET /v1/doctors/{doctor_id}/slots?status=open` to find a slot with `status: "open"` and note its `id`.
+  </Step>
+  <Step title="Generate a client-side Idempotency-Key">
+    Create a UUID v4 on the client (e.g. `uuidgen`, `crypto.randomUUID()`, `uuid.uuid4()`). Store it durably before sending the request so you can reuse it on retries.
+  </Step>
+  <Step title="POST the booking">
+    Send the request with the `Authorization` and `Idempotency-Key` headers. On success, persist the returned `id` (consultation UUID) for downstream use.
+  </Step>
+  <Step title="Follow the Location header">
+    Use the `Location` response header — `/v1/consultations/{id}` — to track the consultation through its lifecycle.
+  </Step>
+</Steps>
+
+---
+
+**Initial booking**
+
+```bash curl
+curl -s -i -X POST https://api.amrutam.example/v1/bookings \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." \
+  -H "Idempotency-Key: f47ac10b-58cc-4372-a567-0e02b2c3d479" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "slot_id": "018f5a3b-1d2e-7000-b3c4-000000000010"
+  }'
+```
+
+```http Response (202 Accepted)
+HTTP/1.1 202 Accepted
+Location: /v1/consultations/018f6c4d-2e3f-7000-c5d6-000000000020
+Content-Type: application/json
+
+{
+  "id": "018f6c4d-2e3f-7000-c5d6-000000000020",
+  "status": "held",
+  "slot_id": "018f5a3b-1d2e-7000-b3c4-000000000010"
+}
+```
+
+**Retry with the same `Idempotency-Key`**
+
+Resubmitting after a network timeout — using the **same key** — returns the identical `202` body without creating a duplicate consultation.
+
+```bash curl (retry)
+curl -s -X POST https://api.amrutam.example/v1/bookings \
+  -H "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..." \
+  -H "Idempotency-Key: f47ac10b-58cc-4372-a567-0e02b2c3d479" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "slot_id": "018f5a3b-1d2e-7000-b3c4-000000000010"
+  }'
+```
+
+```json Response (202 — replayed, identical body)
+{
+  "id": "018f6c4d-2e3f-7000-c5d6-000000000020",
+  "status": "held",
+  "slot_id": "018f5a3b-1d2e-7000-b3c4-000000000010"
+}
+```
+
+---
+
+**Error reference**
+
+<AccordionGroup>
+  <Accordion title="400 Bad Request — missing Idempotency-Key or invalid body">
+    Returned when the `Idempotency-Key` header is absent, or when the request body fails validation (e.g. `slot_id` is too short or missing entirely).
+
+    ```json
+    {
+      "detail": "Idempotency-Key header is required"
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="403 Forbidden — caller is not a patient">
+    The Bearer token belongs to a `doctor` or `admin` account. Only `patient` tokens may create bookings.
+
+    ```json
+    {
+      "detail": "Forbidden"
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="409 Conflict — slot already booked or locked">
+    The target slot is not in `open` status (it is `held`, `cancelled`, or being processed by a concurrent request). Fetch a fresh slot list and retry with a different `slot_id`.
+
+    ```json
+    {
+      "detail": "slot not open (status=held)",
+      "code": "slot_taken"
+    }
+    ```
+  </Accordion>
+
+  <Accordion title="429 Too Many Requests — rate limit exceeded">
+    The patient has exceeded 30 booking attempts within a 60-second window. Back off and retry after the window resets.
+
+    ```json
+    {
+      "detail": "rate limit exceeded"
+    }
+    ```
+  </Accordion>
+</AccordionGroup>
+
+<Tip>
+  Always generate the `Idempotency-Key` **before** sending the request and persist it alongside the in-flight booking record in your client state. If you generate the key only after receiving a timeout error, you risk not having the original key and accidentally creating a duplicate booking with a new key.
+</Tip>

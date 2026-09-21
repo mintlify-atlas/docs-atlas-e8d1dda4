@@ -1,47 +1,260 @@
 ---
-title: "Quickstart"
-description: "Begin with a guide on the fastest path to a successful outcome"
+title: "Get Started with Amrutam Telemedicine API"
+sidebarTitle: "Quickstart"
+description: "Run the full Amrutam telemedicine stack locally with Docker Compose — from cloning the repo to making your first authenticated API request in minutes."
 ---
 
-Describe how someone begins using your product. What is the first thing they need to do? Are there any prerequisites?
-
-A quickstart should take someone from zero to using your product. They'll get a quick win and a sense of what they can accomplish.
+This guide walks you through standing up the complete Amrutam telemedicine stack on your local machine — Nginx edge, FastAPI replicas, Postgres primary and replica, Redis, MinIO, and the full observability stack — using Docker Compose. You will also find a local development path (no Docker for the API process) and a first-request walkthrough that registers a user, logs in, and lists available doctors.
 
 ## Prerequisites
 
-Before you begin, you must have:
+Before you begin, make sure the following are installed:
 
-- Requirement one (for example, Node.js 18+, a free account, an API key)
-- Requirement two (for example, a compatible device, a compatible browser, a compatible operating system)
+- **Docker Engine** with **Compose v2** (`docker compose` — note: no hyphen in the subcommand)
+- **Python 3.11+** (only required for the local dev path, not for the Docker path)
 
-## Get started
+<Tip>
+  Run `docker compose version` to confirm you have Compose v2. Compose v1 (`docker-compose`) is not supported.
+</Tip>
+
+## Docker Compose Startup
 
 <Steps>
-  <Step title="Install">
-    Describe how to install your product or sign up.
+  <Step title="Clone the repository and copy the environment file">
+    Clone the repo, then create your local `.env` from the provided example. The `.env.example` contains safe development defaults — do not commit your `.env` to version control.
 
     ```bash
-    npm install your-package
+    git clone https://github.com/ManiGOo/amrutam_backend.git
+    cd amrutam_backend
+    cp .env.example .env
+    ```
+
+    Key variables set by the example (all safe for local use):
+
+    | Variable | Default | Purpose |
+    |---|---|---|
+    | `DATABASE_URL` | `postgresql+asyncpg://amrutam:amrutam@postgres-primary:5432/amrutam` | Primary RW connection |
+    | `REPLICA_DATABASE_URL` | `…@postgres-replica:5432/amrutam` | Read replica for search/analytics |
+    | `REDIS_URL` | `redis://redis:6379/0` | Cache, idempotency, streams, rate limits |
+    | `JWT_ACCESS_TTL_MIN` | `15` | Access token lifetime in minutes |
+    | `JWT_REFRESH_TTL_DAYS` | `7` | Refresh token lifetime in days |
+    | `OTEL_ENABLED` | `false` (`.env.example`) / `true` (compose) | Tracing toggle |
+    | `PRESCRIPTION_KEK_B64` | zero-key placeholder | Rx encryption key — replace with `base64(32 random bytes)` in production |
+  </Step>
+
+  <Step title="Build images and start core services">
+    This command builds the API image and starts every service defined in `docker-compose.yml` without a profile tag: Nginx, the API, Postgres primary, Redis, MinIO, OTel collector, Prometheus, Loki, Tempo, Grafana, and MailHog.
+
+    ```bash
+    docker compose up -d --build
+    ```
+
+    <Note>
+      The first build downloads base images and installs Python dependencies — expect 3–5 minutes on a cold cache. Subsequent builds are fast because the layer cache is warm.
+    </Note>
+
+    The API exposes `:8000` on the internal Docker network only. All external traffic enters through Nginx on `:8443` (TLS) and `:8080` (plain HTTP).
+  </Step>
+
+  <Step title="Run database migrations">
+    Apply the Alembic migrations to the Postgres primary. This creates the full schema including partitioned tables for `availability_slots`, `consultations`, and `audit_logs`.
+
+    ```bash
+    docker compose exec api alembic upgrade head
+    ```
+
+    You should see output similar to:
+
+    ```
+    INFO  [alembic.runtime.migration] Running upgrade  -> 0001_initial, initial schema
+    INFO  [alembic.runtime.migration] Running upgrade 0001_initial -> 0002_partitions, partitioned tables
+    INFO  [alembic.runtime.migration] Running upgrade 0002_partitions -> 0003_indexes, covering indexes
     ```
   </Step>
-  <Step title="Configure">
-    Describe any setup or configuration needed before first use.
+
+  <Step title="(Optional) Start the read replica">
+    The Postgres read replica is gated behind the `replica` profile. It is used by the search and analytics routes. For a full-fidelity local environment, bring it up and run migrations against it.
 
     ```bash
-    your-cli init
+    docker compose --profile replica up -d postgres-replica
+    DATABASE_URL=postgresql+asyncpg://amrutam:amrutam@localhost:5434/amrutam \
+      .venv/bin/alembic upgrade head
+    ```
+
+    <Info>
+      In this demo setup the replica is a standalone Postgres instance seeded with the same migrations — not a true streaming replica. In production, point `REPLICA_DATABASE_URL` at a real streaming standby.
+    </Info>
+  </Step>
+
+  <Step title="Scale API replicas">
+    The JWT keypair is generated once by the first API replica into a shared `jwt-secrets` Docker volume. Start one replica first (already running after step 2), then scale to three. Nginx automatically load-balances across all healthy replicas and evicts any that fail three consecutive health checks.
+
+    ```bash
+    docker compose up -d --scale api=3 --no-deps api
     ```
   </Step>
-  <Step title="Run it">
-    Show the first thing a user does to see it working.
+
+  <Step title="Verify the stack is healthy">
+    Hit the liveness endpoint through Nginx:
 
     ```bash
-    your-cli start
+    curl -k https://localhost:8443/health
+    ```
+
+    Expected response:
+
+    ```json
+    {"status": "ok"}
+    ```
+
+    For a readiness check that validates database and Redis connectivity:
+
+    ```bash
+    curl -k https://localhost:8443/ready
     ```
   </Step>
 </Steps>
 
-<Tip>
-  Give people a way to get help. This could be a link to a support page, a chat with a customer support agent, or a forum for your product.
+## Service Endpoints
 
-  Example: Need help? Reach out to us at [support@yourcompany.com](mailto:support@yourcompany.com).
+Once the stack is running, all services are reachable at the following addresses from your host machine:
+
+| Service | URL | Notes |
+|---|---|---|
+| **API** (via Nginx TLS) | `https://localhost:8443` | All API traffic enters here |
+| **API** (via Nginx HTTP) | `http://localhost:8080` | Redirects to HTTPS in prod config |
+| **Grafana** | `http://localhost:3000` | Login: `admin` / `admin` |
+| **Prometheus** | `http://localhost:9090` | Metrics scrape targets |
+| **MinIO Console** | `http://localhost:9001` | Object storage browser |
+| **MailHog** | `http://localhost:8025` | Dev SMTP — captures outbound email |
+| **Postgres primary** | `localhost:5432` | Direct psql access |
+| **Postgres replica** | `localhost:5434` | When `replica` profile is active |
+| **Redis** | `localhost:6379` | Direct redis-cli access |
+
+<Warning>
+  The API on `:8000` is intentionally **not** exposed to the host. Route all requests through Nginx on `:8443`. Bypassing the edge layer skips TLS, rate limiting, and the `X-Request-Id` injection.
+</Warning>
+
+## Local Development (Without Docker API)
+
+If you want to iterate on the API code without rebuilding Docker images, run the FastAPI process directly in a virtual environment. You still need the infrastructure services (Postgres and Redis) running in Docker.
+
+```bash
+# Create and activate a virtual environment
+python3 -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+
+# Install the package and all dev dependencies
+pip install -e ".[dev]"
+
+# Start only the infrastructure services
+docker compose up -d postgres-primary redis
+
+# Apply migrations
+alembic upgrade head
+
+# Run the test suite (23 tests, requires PG + Redis up)
+python -m pytest tests/ -q
+
+# Lint, format check, and type check
+ruff check src tests
+black --check src tests
+mypy src
+```
+
+<Tip>
+  Run `python -m pytest tests/test_booking.py -q` to exercise the race condition, replay, and outbox tests specifically — these are the most important correctness tests in the suite.
 </Tip>
+
+## First Request: Register → Login → List Doctors
+
+Here is a complete end-to-end flow using the live stack. All requests go through Nginx on `:8443` with `-k` to accept the self-signed TLS certificate.
+
+<Tabs>
+  <Tab title="curl">
+    **Step 1 — Register a new patient account:**
+
+    ```bash
+    curl -k -s -X POST https://localhost:8443/v1/auth/register \
+      -H "Content-Type: application/json" \
+      -d '{
+        "email": "patient@example.com",
+        "password": "SuperSecret123!",
+        "role": "patient",
+        "full_name": "Ada Lovelace"
+      }' | python3 -m json.tool
+    ```
+
+    **Step 2 — Log in and capture the access token:**
+
+    ```bash
+    TOKEN=$(curl -k -s -X POST https://localhost:8443/v1/auth/login \
+      -H "Content-Type: application/json" \
+      -d '{
+        "email": "patient@example.com",
+        "password": "SuperSecret123!"
+      }' | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
+    echo "Access token: $TOKEN"
+    ```
+
+    **Step 3 — List available doctors:**
+
+    ```bash
+    curl -k -s https://localhost:8443/v1/doctors \
+      -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
+    ```
+  </Tab>
+  <Tab title="httpx (Python)">
+    ```python
+    import httpx
+
+    BASE = "https://localhost:8443"
+    # Use verify=False only for local self-signed certs — never in production
+    client = httpx.Client(base_url=BASE, verify=False)
+
+    # Step 1 — Register
+    resp = client.post("/v1/auth/register", json={
+        "email": "patient@example.com",
+        "password": "SuperSecret123!",
+        "role": "patient",
+        "full_name": "Ada Lovelace",
+    })
+    resp.raise_for_status()
+    print("Registered:", resp.json())
+
+    # Step 2 — Login
+    resp = client.post("/v1/auth/login", json={
+        "email": "patient@example.com",
+        "password": "SuperSecret123!",
+    })
+    resp.raise_for_status()
+    access_token = resp.json()["access_token"]
+    print("Access token acquired")
+
+    # Step 3 — List doctors
+    resp = client.get(
+        "/v1/doctors",
+        headers={"Authorization": f"Bearer {access_token}"},
+    )
+    resp.raise_for_status()
+    doctors = resp.json()
+    print(f"Found {len(doctors)} doctor(s):", doctors)
+    ```
+  </Tab>
+</Tabs>
+
+<Note>
+  All API errors follow RFC 7807 Problem+JSON format with `title`, `detail`, `code`, and `trace_id` fields. If a request fails, inspect the `trace_id` field and look it up in Grafana → Explore → Tempo to see the full distributed trace.
+</Note>
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Architecture" icon="diagram-project" href="/architecture">
+    Understand the service topology, booking sequence diagram, partitioning strategy, and measured SLO results.
+  </Card>
+  <Card title="Authentication" icon="key" href="/concepts/authentication">
+    Learn about the JWT lifecycle, MFA enrollment, token refresh, and RBAC enforcement details.
+  </Card>
+</CardGroup>

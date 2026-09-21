@@ -1,0 +1,139 @@
+---
+title: "Rate Limiting: Nginx Edge and Per-User Redis Buckets"
+sidebarTitle: "Rate Limiting"
+description: "Dual-layer rate limiting combines Nginx edge limits per IP and per JWT with Redis fixed-window token buckets on booking and payment endpoints per user."
+---
+
+The Amrutam API protects against abuse and accidental traffic spikes with a two-layer rate limiting strategy. The outer layer lives at the Nginx edge and applies coarse limits based on IP address and JWT header — these fire before any request reaches the FastAPI application. The inner layer lives in the application and uses Redis to enforce fine-grained per-user fixed-window buckets on the endpoints most sensitive to abuse: booking creation and payment initiation. Both layers must independently pass for a request to be processed.
+
+## Layer 1: Nginx Edge Limits
+
+Nginx is configured with two `limit_req_zone` directives applied to all proxied traffic:
+
+```nginx
+# infra/nginx/amrutam.conf
+limit_req_zone $binary_remote_addr zone=user_ip:10m rate=20r/s;
+limit_req_zone $http_authorization zone=user_jwt:10m rate=10r/s;
+
+location / {
+    limit_req zone=user_ip burst=50 nodelay;
+    limit_req zone=user_jwt burst=20 nodelay;
+    proxy_pass http://api_backend;
+    ...
+}
+```
+
+<CardGroup cols={2}>
+  <Card title="IP Zone (user_ip)" icon="globe">
+    **20 requests/second** per client IP address with a burst allowance of 50. Catches volumetric attacks from a single IP regardless of the JWT presented.
+  </Card>
+  <Card title="JWT Zone (user_jwt)" icon="key">
+    **10 requests/second** per unique `Authorization` header value with a burst of 20. Catches credential-stuffing loops and client bugs that send the same token in a tight loop.
+  </Card>
+</CardGroup>
+
+The `nodelay` flag means burst requests are served immediately rather than queued — requests exceeding the burst allowance get an immediate `503` from Nginx rather than building up a queue that wastes upstream resources.
+
+<Note>
+The Nginx zones use shared memory (`10m` each) so limits are enforced across all worker processes on the same Nginx instance. For multi-node Nginx deployments, use `lua-resty-limit-traffic` or a shared Redis backend at the edge tier.
+</Note>
+
+## Layer 2: Redis Fixed-Window Token Buckets
+
+For booking and payment routes, the application layer applies an additional per-user fixed-window counter in Redis. The implementation uses a simple INCR + EXPIRE pattern — the counter is incremented atomically; on the first increment for a window, an expiry is set to define the window boundary:
+
+```python
+# src/amrutam/core/ratelimit.py
+async def check_rate_limit(redis: Any, key: str, limit: int = 60, window_s: int = 60) -> None:
+    try:
+        count = await redis.incr(f"rl:{key}")
+        if count == 1:
+            await redis.expire(f"rl:{key}", window_s)
+    except Exception as e:  # noqa: BLE001 — fail open, alert fires
+        log.warning("rate limit skipped (redis down): %s", e)
+        return
+    if count > limit:
+        raise RateLimited(f"rate limit exceeded ({limit}/{window_s}s)")
+```
+
+The function raises `RateLimited` — a subclass of `AppError` — which the global error handler converts into an RFC 7807 `application/problem+json` response:
+
+```json
+{
+  "title": "rate_limited",
+  "detail": "rate limit exceeded (30/60s)",
+  "code": "rate_limited",
+  "trace_id": "b3a2e1f0..."
+}
+```
+
+### Per-Endpoint Limits
+
+| Endpoint | Limit | Window | Key |
+|---|---|---|---|
+| `POST /v1/bookings` | 30 requests | 60 seconds | `rl:booking:{patient_id}` |
+| `POST /v1/payments` | 30 requests | 60 seconds | `rl:payment:{user_id}` |
+
+These limits are applied **per authenticated user**, not per IP. This ensures that multiple patients sharing a network (e.g. a hospital Wi-Fi) are not unfairly throttled by a single user's abuse.
+
+## Failure Behaviour: Fail-Open
+
+A deliberate design decision is that the Redis token bucket **fails open** — if Redis is unavailable, rate limiting is skipped and the request is allowed through. The Nginx edge layer remains active as a backstop.
+
+```python
+    except Exception as e:  # noqa: BLE001 — fail open, alert fires
+        log.warning("rate limit skipped (redis down): %s", e)
+        return
+```
+
+<Tip>
+The fail-open approach keeps booking and payment endpoints available during a Redis outage. The comment in the source is explicit: "availability beats strict throttling (edge Nginx still throttles; `redis down` alert covers the abuse window)". If your threat model requires stricter throttling on auth endpoints, those can be individually switched to fail-closed by re-raising instead of returning.
+</Tip>
+
+## HTTP 429 Response
+
+When a Redis bucket is exhausted, the application returns `HTTP 429 Too Many Requests` with a Problem+JSON body. Clients should read the `Retry-After` header (set by Nginx for edge-level rejections) or apply exponential backoff with jitter:
+
+```python
+# src/amrutam/core/errors.py
+class RateLimited(AppError):
+    status = 429
+    title = "rate_limited"
+    code = "rate_limited"
+```
+
+<Tip>
+Implement client-side retry with `Retry-After` awareness. When the server returns `429`, wait for the indicated number of seconds before retrying. A simple linear backoff that ignores `Retry-After` will continue hitting the rate limit window and waste both client and server resources.
+</Tip>
+
+## Exempt Endpoints
+
+Health, readiness, and metrics endpoints bypass all application-level rate limiting to ensure monitoring and load balancer probes are never throttled. The audit middleware skip list is used as the reference:
+
+```python
+# src/amrutam/api/middleware/audit.py
+SKIP_PREFIXES = ("/health", "/ready", "/docs", "/redoc", "/openapi.json")
+```
+
+The `/metrics` endpoint is similarly excluded from rate limiting — Prometheus scrapes it on a fixed interval and a stray `429` would create false gaps in time-series data.
+
+## Scaling Across Replicas
+
+Because the Redis bucket keys are namespaced by user ID (`rl:booking:{patient_id}`), the counters work correctly across multiple API replicas. All replicas share the same Redis instance, so a patient who makes 20 requests to replica 1 and 10 requests to replica 2 will correctly trigger the 30-request limit — the counts are not per-replica.
+
+<Note>
+When scaling the API with `docker compose up -d --scale api=N`, no additional rate-limit configuration is needed. The Redis key space is shared, and the Nginx upstream automatically distributes load across all healthy replicas using `least_conn`. Start with one replica first to mint the shared JWT keypair volume before scaling.
+</Note>
+
+## Two-Layer Summary
+
+<Accordion title="Full rate limit decision path for a booking request">
+  1. Request arrives at Nginx on port 8443.
+  2. Nginx checks `user_ip` zone: if this IP has exceeded 20 r/s (burst 50), Nginx returns `503` immediately — request never reaches FastAPI.
+  3. Nginx checks `user_jwt` zone: if this Authorization header value has exceeded 10 r/s (burst 20), Nginx returns `503`.
+  4. Nginx proxies the request to a FastAPI replica.
+  5. FastAPI authenticates the JWT and extracts the user ID.
+  6. FastAPI calls `check_rate_limit(redis, f"booking:{patient_id}", limit=30, window_s=60)`.
+  7. If the Redis counter exceeds 30 for this patient in the current 60-second window, `RateLimited` is raised and a `429` Problem+JSON response is returned.
+  8. Otherwise, the booking request proceeds to business logic.
+</Accordion>

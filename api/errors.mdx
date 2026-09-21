@@ -1,0 +1,192 @@
+---
+title: "API Error Responses: RFC 7807 Problem+JSON"
+sidebarTitle: "Errors"
+description: "RFC 7807 Problem+JSON errors: response schema, HTTP status codes, machine-readable error codes, and using trace_id to find failures in Loki and Tempo."
+---
+
+Every error response from the Amrutam Telemedicine API conforms to [RFC 7807 Problem+JSON](https://datatracker.ietf.org/doc/html/rfc7807). Whether a request fails due to a bad token, a race condition on slot booking, or a validation error in the request body, the shape of the error is always the same. The `Content-Type` is always `application/problem+json`, and the body contains a structured JSON object — never a plain string, never an HTML error page, and never a stack trace.
+
+## Error Response Schema
+
+All error responses share this four-field structure, defined in `src/amrutam/core/errors.py`:
+
+<ResponseField name="title" type="string" required>
+  A short, human-readable error category that maps to the exception class — for example `unauthorized`, `forbidden`, or `conflict`. Stable across API versions; safe to use in logging.
+</ResponseField>
+
+<ResponseField name="detail" type="string" required>
+  A specific, context-aware description of what went wrong — for example `"slot already held by another booking"` or `"token has expired"`. May vary between occurrences of the same `title`.
+</ResponseField>
+
+<ResponseField name="code" type="string" required>
+  A machine-readable error code for programmatic handling. In most cases this matches `title`, but subclasses can refine it — for example `Conflict` has `code: conflict` while `AlreadyExists` (a subclass) uses `code: already_exists`.
+</ResponseField>
+
+<ResponseField name="trace_id" type="string" required>
+  The `x-request-id` header value echoed back from the request. Use this to locate the corresponding structured log entry in Grafana Loki or the trace in Grafana Tempo. Empty string if the header was not sent by the client or proxy.
+</ResponseField>
+
+<Note>
+  Stack traces are **never** included in error responses — not even for `500 Internal Server Error`. The `trace_id` is the only handle available for server-side debugging. Pass it to support or use it to filter logs in Loki with the `trace_id` label.
+</Note>
+
+## HTTP Status Codes
+
+The API uses a focused subset of HTTP status codes. Each maps to a specific class of error.
+
+<Accordion title="400 Bad Request — Validation & Missing Headers">
+  Returned when the request is syntactically or semantically invalid before any business logic runs. Common causes include missing the required `Idempotency-Key` header on `POST /v1/bookings` or `POST /v1/payments`, or sending a body that fails structural validation outside of Pydantic.
+
+  **Error class:** `BadRequest` — `code: bad_request`
+</Accordion>
+
+<Accordion title="401 Unauthorized — Invalid or Expired JWT">
+  Returned when no token is present, the token signature is invalid, or the token has expired. After a `401`, discard the access token and use `POST /v1/auth/refresh` to obtain a new pair. If the refresh token is also expired or revoked, the user must re-authenticate.
+
+  **Error class:** `Unauthorized` — `code: unauthorized`
+</Accordion>
+
+<Accordion title="403 Forbidden — Wrong Role or Ownership Violation">
+  Returned when the token is valid but the caller does not have permission to perform the requested action. This covers role-based restrictions (e.g., a patient calling an admin-only endpoint) and ownership checks (e.g., reading a consultation that belongs to another patient).
+
+  **Error class:** `Forbidden` — `code: forbidden`
+</Accordion>
+
+<Accordion title="404 Not Found — Resource Does Not Exist">
+  Returned when the requested resource identifier does not correspond to any record in the database — for example, a `cid` or `rx_id` that was never created, or was deleted.
+
+  **Error class:** `NotFound` — `code: not_found`
+</Accordion>
+
+<Accordion title="409 Conflict — Slot Race Condition or Duplicate">
+  Returned when a write operation cannot succeed due to a concurrent state conflict. The most common case is two clients attempting to book the same slot simultaneously; the losing request receives a `409`. Also returned when an `AlreadyExists` subclass fires (e.g., duplicate registration with the same email). **Retry with a different slot_id — retrying the same request will not resolve the conflict.**
+
+  **Error classes:** `Conflict` — `code: conflict`; `AlreadyExists` — `code: already_exists`
+</Accordion>
+
+<Accordion title="422 Unprocessable Entity — Pydantic Validation Error">
+  FastAPI's default response for request bodies that fail Pydantic schema validation. The response format switches to FastAPI's built-in `HTTPValidationError` shape (not Problem+JSON) and includes field-level `loc`/`msg`/`type` detail. Check request body field types and constraints before retrying.
+</Accordion>
+
+<Accordion title="429 Too Many Requests — Rate Limit Exceeded">
+  The API enforces two rate-limit tiers at the Nginx edge and at the application layer. Exceeding either returns `429`. Back off exponentially and respect any `Retry-After` header present on the response.
+
+  **Error class:** `RateLimited` — `code: rate_limited`
+</Accordion>
+
+<Accordion title="500 Internal Server Error — Unhandled Exception">
+  Returned when an unexpected error escapes all application-level handlers. The response body contains only `title` and `trace_id` — no detail, no stack trace. Report the `trace_id` to the platform team for investigation.
+
+  **Error class:** `AppError` (base) — `code: internal_error`
+</Accordion>
+
+## Example Error Responses
+
+The examples below show real response bodies for the most commonly encountered error conditions.
+
+<Tabs>
+  <Tab title="401 Unauthorized">
+    Triggered by a missing, malformed, or expired `Authorization: Bearer` token.
+
+    ```json
+    {
+      "title": "unauthorized",
+      "detail": "token has expired",
+      "code": "unauthorized",
+      "trace_id": "01HX9K2MFVNQR4T8WBZYD6E3PG"
+    }
+    ```
+
+    **Next step:** call `POST /v1/auth/refresh` with a valid refresh token, then retry the original request with the new access token.
+  </Tab>
+
+  <Tab title="403 Forbidden">
+    Triggered when the caller's role or ownership check fails — for example, a `patient` calling `GET /v1/auth/admin/ping`.
+
+    ```json
+    {
+      "title": "forbidden",
+      "detail": "admin role required",
+      "code": "forbidden",
+      "trace_id": "01HX9K3RQZS7A2NMCVFBXPW4DH"
+    }
+    ```
+
+    **Next step:** verify the account has the required role. Role elevation requires a new login session and token pair.
+  </Tab>
+
+  <Tab title="409 Conflict">
+    Triggered when two clients race to book the same slot and this client loses the advisory-lock contest.
+
+    ```json
+    {
+      "title": "conflict",
+      "detail": "slot already held by another booking",
+      "code": "conflict",
+      "trace_id": "01HX9K5TPFYW3LVHX2RZQN8SJB"
+    }
+    ```
+
+    **Next step:** fetch an updated list of available slots via `GET /v1/doctors/{doctor_id}/slots` and retry the booking with a different `slot_id`. Do **not** retry with the same `slot_id` — it will not succeed.
+  </Tab>
+
+  <Tab title="429 Too Many Requests">
+    Triggered when the client exceeds the configured request rate limit at the Nginx edge or application layer.
+
+    ```json
+    {
+      "title": "rate_limited",
+      "detail": "too many requests — slow down",
+      "code": "rate_limited",
+      "trace_id": "01HX9K7BCDJN6QPZT5RWUV1EMK"
+    }
+    ```
+
+    **Next step:** implement exponential backoff with jitter. Check the `Retry-After` response header if present — it specifies the number of seconds to wait before retrying.
+  </Tab>
+</Tabs>
+
+## Using `trace_id` for Debugging
+
+Every error response echoes back the `x-request-id` header as `trace_id`. This value is the primary correlation handle between a client-visible error and server-side telemetry.
+
+<Steps>
+  <Step title="Capture the trace_id">
+    Read `trace_id` from the error response body. If you control the HTTP client, also set `x-request-id` on every outgoing request to a UUID you generate — this ensures the value in Loki matches what you logged client-side.
+  </Step>
+  <Step title="Search Grafana Loki">
+    Open Grafana → Explore → select the **Loki** datasource. Filter by the `trace_id` label:
+    ```logql
+    {app="amrutam"} | json | trace_id="01HX9K2MFVNQR4T8WBZYD6E3PG"
+    ```
+    This returns all structured log lines emitted during that request, including the `app_error` event logged by the exception handler in `main.py`.
+  </Step>
+  <Step title="Jump to Grafana Tempo (if OTel is enabled)">
+    If `OTEL_ENABLED=true` is set (as it is in the Docker Compose stack), the same `trace_id` links to a distributed trace in Tempo. Open Grafana → Explore → select the **Tempo** datasource and paste the `trace_id` to see the full span waterfall including database and Redis call durations.
+  </Step>
+  <Step title="Escalate with context">
+    When filing an incident or support request, include the full `trace_id`, the HTTP method and path, the UTC timestamp, and the HTTP status code. Avoid sharing request bodies containing PHI.
+  </Step>
+</Steps>
+
+<Info>
+  The `trace_id` field is an empty string (`""`) when the `x-request-id` header is absent from the request. The Nginx edge proxy injects this header automatically for all inbound requests — if you are calling the API directly (bypassing Nginx during local development), set the header manually to enable correlation.
+</Info>
+
+## Error Code Reference
+
+| HTTP Status | `title` | `code` | Source Class |
+|---|---|---|---|
+| `400` | `bad_request` | `bad_request` | `BadRequest` |
+| `401` | `unauthorized` | `unauthorized` | `Unauthorized` |
+| `403` | `forbidden` | `forbidden` | `Forbidden` |
+| `404` | `not_found` | `not_found` | `NotFound` |
+| `409` | `conflict` | `conflict` | `Conflict` |
+| `409` | `conflict` | `already_exists` | `AlreadyExists` |
+| `422` | *(FastAPI default)* | *(FastAPI default)* | Pydantic `ValidationError` |
+| `429` | `rate_limited` | `rate_limited` | `RateLimited` |
+| `500` | `internal_error` | `internal_error` | `AppError` (base) |
+
+<Warning>
+  Do not build business logic around the `detail` string — it is a human-readable message intended for logging and support, and its exact wording may change between releases. Use the `code` field for programmatic branching.
+</Warning>
