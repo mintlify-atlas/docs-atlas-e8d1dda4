@@ -1,7 +1,7 @@
 ---
-title: "Observability: Metrics, Logs, and Traces"
+title: "Observability: Metrics, Logs, and Distributed Traces"
 sidebarTitle: "Observability"
-description: "OTel SDK auto-instrumentation, Prometheus RED metrics, Loki structured logging, Tempo distributed tracing, Grafana dashboards, and production alert thresholds for Amrutam."
+description: "OTel auto-instrumentation, Prometheus RED metrics, Loki structured logs, Tempo tracing, Grafana dashboards, and SLO alert thresholds for the Amrutam API."
 ---
 
 Amrutam ships a complete observability stack out of the box. Every Docker Compose deployment includes Prometheus for metrics, Loki for logs, Tempo for traces, and Grafana for dashboards — all wired together through a central OpenTelemetry collector. The API emits business counters alongside the standard RED (Rate / Errors / Duration) histogram, so a single Grafana session can answer both "is the system healthy?" and "how many prescriptions were sealed today?".
@@ -27,7 +27,6 @@ it installs four instrumentors:
 FastAPIInstrumentor.instrument_app(app)   # HTTP spans for every route
 AsyncPGInstrumentor().instrument()        # Span per SQL statement
 RedisInstrumentor().instrument()          # Span per Redis command
-# httpx instrumented implicitly by FastAPI instrumentor
 ```
 
 Spans are exported via `BatchSpanProcessor` over gRPC to the OTel collector at
@@ -140,7 +139,7 @@ corresponding Tempo trace with Grafana's trace-to-log correlation feature.
 
 Traces flow from the API through the OTel collector to Tempo:
 
-```
+```text
 API (BatchSpanProcessor)
   └─► otel-collector :4317 (gRPC OTLP receiver)
         └─► batch processor

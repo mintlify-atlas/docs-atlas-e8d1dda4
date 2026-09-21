@@ -1,5 +1,5 @@
 ---
-title: "Environment Variables and Configuration Reference"
+title: "Environment Variables: Amrutam Configuration Reference"
 sidebarTitle: "Environment"
 description: "Complete reference for all Amrutam environment variables: database, Redis, S3, JWT key paths, prescription KEK, webhook secret, and OTel tracing knobs."
 ---
@@ -28,23 +28,18 @@ The `.env` file is already listed in `.gitignore`. Never commit it.
 
 ## Database
 
-<ParamField body="DATABASE_URL" type="string" required>
+<ParamField body="DATABASE_URL" type="string" default="postgresql+asyncpg://amrutam:amrutam@localhost:5432/amrutam">
   Async SQLAlchemy URL for the PostgreSQL **primary** (read-write) node. All
-  writes, booking transactions, and migrations target this connection.
-
-  ```
-  postgresql+asyncpg://amrutam:amrutam@postgres-primary:5432/amrutam
-  ```
+  writes, booking transactions, and migrations target this connection. In the
+  Docker Compose stack this is overridden to point at the `postgres-primary`
+  service hostname.
 </ParamField>
 
-<ParamField body="REPLICA_DATABASE_URL" type="string" required>
+<ParamField body="REPLICA_DATABASE_URL" type="string" default="postgresql+asyncpg://amrutam:amrutam@localhost:5433/amrutam">
   Async SQLAlchemy URL for the PostgreSQL **replica** (read-only) node. Used by
   the `/v1/search/doctors` keyset cursor and the `/v1/analytics/*` aggregations to
-  keep heavy reads off the primary.
-
-  ```
-  postgresql+asyncpg://amrutam:amrutam@postgres-replica:5432/amrutam
-  ```
+  keep heavy reads off the primary. In the Docker Compose stack this is overridden
+  to point at the `postgres-replica` service hostname on port 5432.
 </ParamField>
 
 <ParamField body="POSTGRES_PASSWORD" type="string" default="amrutam">
@@ -57,7 +52,7 @@ The `.env` file is already listed in `.gitignore`. Never commit it.
 
 ## Redis
 
-<ParamField body="REDIS_URL" type="string" default="redis://redis:6379/0">
+<ParamField body="REDIS_URL" type="string" default="redis://localhost:6379/0">
   Connection URL for Redis 7. Redis serves four distinct roles in the platform:
   idempotency-key replay cache, token bucket rate-limit counters, outbox event
   streams, and refresh-token JTI allow-list. All four roles share database `0`
@@ -69,9 +64,10 @@ The `.env` file is already listed in `.gitignore`. Never commit it.
 
 ## Object Storage
 
-<ParamField body="S3_ENDPOINT" type="string" default="http://minio:9000">
-  Base URL of the S3-compatible object store. In the Compose stack this points to
-  the bundled MinIO container. For AWS S3 set this to the regional endpoint, e.g.
+<ParamField body="S3_ENDPOINT" type="string" default="http://localhost:9000">
+  Base URL of the S3-compatible object store. The code default targets a locally
+  running MinIO instance. In the Docker Compose stack this is overridden to the
+  `minio` service hostname. For AWS S3 set this to the regional endpoint, e.g.
   `https://s3.ap-south-1.amazonaws.com`.
 </ParamField>
 
@@ -158,11 +154,12 @@ The `.env` file is already listed in `.gitignore`. Never commit it.
 
 ## Observability
 
-<ParamField body="OTEL_EXPORTER_OTLP_ENDPOINT" type="string" default="http://otel-collector:4317">
+<ParamField body="OTEL_EXPORTER_OTLP_ENDPOINT" type="string" default="http://localhost:4317">
   gRPC endpoint of the OpenTelemetry collector. The SDK exports spans via
   `BatchSpanProcessor` over this address. Connection failures are silently
   swallowed so the API never becomes unavailable just because the collector is
-  temporarily down.
+  temporarily down. In the Docker Compose stack this is overridden to the
+  `otel-collector` service hostname.
 </ParamField>
 
 <ParamField body="OTEL_ENABLED" type="boolean" default="false">

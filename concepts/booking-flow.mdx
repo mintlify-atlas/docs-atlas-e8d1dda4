@@ -1,7 +1,7 @@
 ---
-title: "Idempotent Booking: How Slot Reservation Works"
+title: "Idempotent Slot Booking: Retries, Locks, and Race Safety"
 sidebarTitle: "Booking Flow"
-description: "How the booking endpoint survives network retries and 10-way race conditions using a Redis replay cache, PostgreSQL advisory locks, and SELECT FOR UPDATE SKIP LOCKED."
+description: "How the booking endpoint handles retries and concurrent requests using a Redis replay cache, PostgreSQL advisory locks, and SELECT FOR UPDATE SKIP LOCKED."
 ---
 
 Booking a consultation slot is one of the most race-prone operations in a telemedicine platform: a popular doctor's 9 AM slot can see dozens of patients submit near-simultaneous requests, and mobile clients routinely retry on network timeout without knowing whether the original request landed. The Amrutam booking service solves both problems in a single code path — idempotency for retries, and PostgreSQL-level locking for concurrency — so that exactly one consultation row is ever created per slot.
@@ -98,7 +98,7 @@ The booking endpoint returns **202 Accepted** rather than 201 Created because th
 
 ## Rate Limiting
 
-Booking requests are limited to **30 per minute per user** via a Redis fixed-window counter keyed as `rl:booking:{user_id}`. The counter is incremented with `INCR` and a 60-second `EXPIRE` is set on the first hit. The limiter **fails open** on Redis outage — Nginx edge rate limits still apply.
+Booking requests are limited to **30 per minute per user** via a Redis fixed-window counter keyed as `booking:{user_id}`. The counter is incremented with `INCR` and a 60-second `EXPIRE` is set on the first hit. The limiter **fails open** on Redis outage — Nginx edge rate limits still apply.
 
 ```python
 await check_rate_limit(redis, f"booking:{patient.id}", limit=30, window_s=60)

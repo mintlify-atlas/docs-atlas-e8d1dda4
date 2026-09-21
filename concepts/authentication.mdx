@@ -1,7 +1,7 @@
 ---
-title: "Authenticate Requests with JWT and TOTP MFA"
+title: "Authenticate API Requests with JWT Tokens and TOTP MFA"
 sidebarTitle: "Authentication"
-description: "RS256 JWT access tokens (15 min TTL), 7-day rotating refresh tokens, argon2id passwords, TOTP MFA enrollment, and three-role RBAC enforced at every endpoint."
+description: "RS256 JWT access tokens (15 min TTL), 7-day rotating refresh tokens, argon2id password hashing, TOTP MFA enrollment, and role-based access control."
 ---
 
 The Amrutam API uses a layered authentication model: passwords are hashed with **argon2id** (time-cost 3, 64 MB memory), identity is asserted via **RS256-signed JWTs**, short-lived access tokens are paired with rotating refresh tokens backed by Redis, and an optional **RFC 6238 TOTP MFA** layer can be enrolled per account. All role enforcement happens in the `require_role()` FastAPI dependency before any business logic runs.

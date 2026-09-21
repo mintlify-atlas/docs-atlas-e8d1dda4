@@ -1,7 +1,7 @@
 ---
-title: "Payment Saga: Intent, Webhook, and Compensation"
+title: "Payment Saga: Intent, Webhook Settlement, and Compensation"
 sidebarTitle: "Payments"
-description: "How the payment saga creates an intent, settles via webhook, confirms the consultation on success, and cancels with slot compensation on failure — all idempotently."
+description: "How the payment saga creates a payment intent, settles via webhook, confirms the consultation on success, and compensates with slot release on failure."
 ---
 
 Charging a patient and confirming a consultation are two separate systems that must stay consistent even when the payment gateway times out, the webhook arrives twice, or the API pod crashes mid-flight. The Amrutam payment service implements a **saga pattern** with a transactional outbox: the booking creates a `held` consultation, the payment intent records a `pending` payment, and the webhook drives the final branch — either committing both sides (`paid` → `confirmed`) or rolling back both sides (`failed` → `cancelled` + slot `open`). Every step is idempotent, so at-least-once webhook delivery never double-charges or double-confirms.

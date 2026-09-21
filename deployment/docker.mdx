@@ -1,7 +1,7 @@
 ---
-title: "Deploy Amrutam with Docker Compose"
+title: "Deploy Amrutam Telemedicine Stack with Docker Compose"
 sidebarTitle: "Docker Compose"
-description: "Run the complete Amrutam telemedicine stack with Docker Compose: service topology, startup order, JWT key sharing, Nginx TLS, replica profiles, and database migrations."
+description: "Run the full Amrutam stack with Docker Compose: service topology, JWT key sharing, Nginx TLS, replica and worker profiles, and Alembic database migrations."
 ---
 
 Docker Compose is the canonical way to run the complete Amrutam stack for local development, integration testing, and single-host staging. One `docker compose up` command brings up the edge proxy, API replicas, PostgreSQL primary, Redis, MinIO, the full observability pipeline, and optional services behind named profiles — no Kubernetes or external infrastructure required.

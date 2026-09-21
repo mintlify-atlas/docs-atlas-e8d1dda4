@@ -28,11 +28,11 @@ docker compose --profile worker up -d
 ```
 
 <CardGroup cols={2}>
-  <Card title="Outbox Relay Worker (arq)" icon="paper-plane">
+  <Card title="Outbox Relay Worker" icon="paper-plane">
     Polls the `outbox_events` table using `SKIP LOCKED` to avoid row contention. Publishes events to Redis Streams. Marks processed rows with `processed=true`. If Redis is unavailable during the relay cycle, the outbox rows remain unprocessed and will be retried on the next poll.
   </Card>
   <Card title="Scheduler" icon="calendar">
-    Runs on a cron schedule to refresh PostgreSQL materialized views that back the analytics endpoints. Stale views return older data but never error — analytics reads degrade gracefully if the scheduler is stopped.
+    Runs a polling loop (sleeping 300 seconds between ticks) to refresh PostgreSQL materialized views that back the analytics endpoints. Stale views return older data but never error — analytics reads degrade gracefully if the scheduler is stopped.
   </Card>
 </CardGroup>
 

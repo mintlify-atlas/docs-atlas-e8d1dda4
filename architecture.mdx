@@ -1,5 +1,5 @@
 ---
-title: "System Architecture and Service Topology"
+title: "Amrutam Architecture: Service Topology and SLO Results"
 sidebarTitle: "Architecture"
 description: "How Amrutam's stateless FastAPI replicas, partitioned Postgres, Redis streams, and transactional outbox combine to meet 100k-consultation-per-day SLOs."
 ---
@@ -35,7 +35,7 @@ The full stack is defined in `docker-compose.yml`. The table below maps each ser
 
 ## Request Flow Overview
 
-```
+```text
 Clients → Nginx (:8443 TLS, limit_req, max_fails=3) → api × N (uvicorn, :8000)
   → Postgres Primary (RW) + Replica (RO) + Redis + MinIO
   → OTel Collector → Prometheus / Loki / Tempo → Grafana

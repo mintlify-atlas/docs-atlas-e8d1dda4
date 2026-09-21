@@ -1,7 +1,7 @@
 ---
-title: "Sealed Prescriptions: Encryption and PDF Storage"
+title: "Sealed Prescriptions: AES-256-GCM Encryption and PDF Storage"
 sidebarTitle: "Prescriptions"
-description: "How prescriptions are sealed with AES-256-GCM envelope encryption, stored as PDFs in MinIO, and served via 5-minute presigned URLs to authorized parties only."
+description: "How prescriptions are sealed with AES-256-GCM envelope encryption, stored as PDFs in MinIO, and served via short-lived presigned URLs to authorized users."
 ---
 
 Prescriptions contain Protected Health Information (PHI) — diagnoses, medication names, and dosages — that must be stored at rest in a form that cannot be read even if the database is compromised. The Amrutam prescription service uses **AES-256-GCM envelope encryption**: each row gets its own randomly generated Data Encryption Key (DEK), which is itself encrypted by a Key Encryption Key (KEK) sourced from the environment (or a KMS in production). The encrypted ciphertext lives in Postgres; the rendered PDF lives in MinIO object storage, accessible only via short-lived presigned URLs.

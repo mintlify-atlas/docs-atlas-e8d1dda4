@@ -1,7 +1,7 @@
 ---
 title: "Prescriptions API: Create, View, and Download PDFs"
 sidebarTitle: "Prescriptions"
-description: "Create sealed prescriptions tied to a consultation, view decrypted metadata, and generate 5-minute presigned PDF download URLs backed by MinIO object storage."
+description: "Create AES-256-GCM sealed prescriptions, retrieve decrypted diagnosis and medicines, and generate presigned MinIO PDF download URLs valid for 5 minutes."
 ---
 
 Prescriptions in Amrutam are cryptographically sealed at rest using AES-256-GCM envelope encryption — the plaintext payload (diagnosis, medicines list, doctor ID, and issuance timestamp) is encrypted under a per-record data encryption key (DEK) that is itself wrapped with the `PRESCRIPTION_KEK_B64` key-encryption key. A rendered PDF is simultaneously uploaded to MinIO under the path `rx/{rx_id}.pdf`. Read access is controlled by the same role rules as consultations: only the treating doctor, the patient on the consultation, or an admin may view or download a prescription.

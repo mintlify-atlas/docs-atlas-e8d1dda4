@@ -1,7 +1,7 @@
 ---
-title: "Consultation Lifecycle and State Transitions"
+title: "Consultation Lifecycle: States, Transitions, and Ownership"
 sidebarTitle: "Consultations"
-description: "How consultations move through held, confirmed, in-progress, and completed states — with ownership rules, action permissions, and keyset pagination across 100k+ rows."
+description: "How consultations move through held, confirmed, in_progress, and completed states — with role-based action permissions and keyset pagination."
 ---
 
 Every booked appointment is represented as a consultation record that progresses through a well-defined state machine. Rather than exposing separate endpoints for each status change, the API exposes a single transition endpoint that accepts a named action. The server validates that the action is legal from the current state, that the caller has the right role, and that ownership rules are satisfied — all before writing anything to the database.

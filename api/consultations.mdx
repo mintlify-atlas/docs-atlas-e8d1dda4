@@ -1,7 +1,7 @@
 ---
 title: "Consultations API: Lifecycle and State Transitions"
 sidebarTitle: "Consultations"
-description: "List, retrieve, and transition consultations through held, confirmed, in-progress, and completed states with role-scoped visibility and audit-logged saga compensations."
+description: "Manage consultations across held, confirmed, in_progress, and completed states with role-scoped access, audit logging, and cancellation saga compensation."
 ---
 
 Every consultation in Amrutam moves through a well-defined state machine — `held → confirmed → in_progress → completed` — with cancellation available from any non-terminal state. Access is role-scoped: a patient sees only their own consultations, a doctor sees only the consultations assigned to them, and an admin sees everything. All state transitions are recorded in the audit log; cancellation additionally triggers a saga compensation that releases the underlying availability slot back to `open`.

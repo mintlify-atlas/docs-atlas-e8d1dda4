@@ -1,7 +1,7 @@
 ---
-title: "Payments API: Create Intent and Handle Webhooks"
+title: "Payments API: Payment Intents, Webhooks, and Sagas"
 sidebarTitle: "Payments"
-description: "Create payment intents for held consultations, handle gateway webhooks with secret validation, and observe saga compensations that auto-cancel failed bookings and free slots."
+description: "Create payment intents for held consultations, handle gateway webhooks with secret validation, and understand saga compensations on failed bookings."
 ---
 
 The Amrutam payment flow follows a saga pattern. A patient (or admin) submits a payment intent via `POST /v1/payments`, which records the intent, calls the mock charge gateway, and immediately synchronises the outcome through the same webhook settlement path used by real gateway callbacks. On a `paid` outcome the consultation moves to `confirmed` and the slot is marked `booked`; on a `failed` outcome the consultation is cancelled and the slot is released back to `open` as a saga compensation. Both paths publish outbox events for downstream consumers. The `POST /v1/payments/webhook` endpoint is idempotent — replaying the same `gateway_ref` with the same terminal status returns the stored payment record without re-applying side effects.

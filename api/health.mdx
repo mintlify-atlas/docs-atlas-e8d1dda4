@@ -1,7 +1,7 @@
 ---
 title: 'Health Endpoints: Liveness, Readiness, and Metrics'
 sidebarTitle: 'Health'
-description: 'Unauthenticated liveness probe at /health, dependency-aware readiness probe at /ready, and per-replica Prometheus metrics scrape endpoint at /metrics.'
+description: 'Unauthenticated liveness probe at /health, shallow readiness probe at /ready, and per-replica Prometheus metrics scrape endpoint at /metrics.'
 ---
 
 The Amrutam API exposes three operational endpoints that are intentionally unversioned — they live at the root of the service, not under `/v1`. All three are unauthenticated so that load balancers, Kubernetes probes, and Prometheus scrapers can reach them without tokens. They are registered via `health_router` in `main.py` before any versioned routers, ensuring they remain reachable even during startup.
@@ -63,13 +63,13 @@ Content-Type: application/json
 GET /ready
 ```
 
-A readiness probe that signals whether the replica is ready to accept traffic. Unlike the liveness probe, readiness checks that upstream dependencies — PostgreSQL and Redis — are reachable before returning `200`. If any dependency is unavailable, the endpoint returns `503 Service Unavailable`, causing Kubernetes to stop routing new requests to that replica until the dependency recovers.
+A readiness probe that signals whether the replica is ready to accept traffic. The current implementation is a **shallow** check — it returns `200 OK` as long as the Python process is alive, without querying PostgreSQL or Redis. Dependency-aware pings (PG + Redis via `container.health()`) are planned for a future rollout; until then, monitor structured logs for upstream errors.
 
 <Info>
-  The current implementation is a shallow readiness check. Dependency pings (PG + Redis via `container.health()`) are introduced in Day 2 of the rollout. The endpoint will return `{"status": "ready"}` in both healthy and degraded states until that check is wired in — monitor the structured logs for upstream errors in the interim.
+  Because the current readiness check has no external dependencies, it always returns `{"status": "ready"}` regardless of downstream availability. It will not return `503` if Postgres or Redis is down. Use liveness probes and structured log alerts together until deep dependency checks are introduced.
 </Info>
 
-A healthy `200` response body is:
+A `200` response body is:
 
 ```json
 { "status": "ready" }
@@ -93,18 +93,11 @@ readinessProbe:
 curl -i https://api.amrutam.example/ready
 ```
 
-```http 200 — replica ready
+```http Response
 HTTP/1.1 200 OK
 Content-Type: application/json
 
 {"status": "ready"}
-```
-
-```http 503 — dependency down
-HTTP/1.1 503 Service Unavailable
-Content-Type: application/json
-
-{"status": "unavailable"}
 ```
 
 </CodeGroup>

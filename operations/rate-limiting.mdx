@@ -72,7 +72,7 @@ The function raises `RateLimited` — a subclass of `AppError` — which the glo
 | Endpoint | Limit | Window | Key |
 |---|---|---|---|
 | `POST /v1/bookings` | 30 requests | 60 seconds | `rl:booking:{patient_id}` |
-| `POST /v1/payments` | 30 requests | 60 seconds | `rl:payment:{user_id}` |
+| `POST /v1/payments` | 30 requests | 60 seconds | `rl:pay:{user_id}` |
 
 These limits are applied **per authenticated user**, not per IP. This ensures that multiple patients sharing a network (e.g. a hospital Wi-Fi) are not unfairly throttled by a single user's abuse.
 
